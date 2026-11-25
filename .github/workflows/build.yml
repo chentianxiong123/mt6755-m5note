@@ -26,9 +26,23 @@ jobs:
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: wget -q https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/linux-6.12.115.tar.gz
 
+      - name: Restore build tree (incremental .o)
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: build-tree.tar
+          key: buildtree-${{ hashFiles('mainline/config/m5note-server.config', 'mainline/dts/mt6755-m5note.dts', 'mainline/patches/**') }}
+          restore-keys: buildtree-
+
       - name: Extract kernel
         run: |
-          tar xf linux-6.12.115.tar.gz
+          if [ -f build-tree.tar ]; then
+            tar xf build-tree.tar
+            echo "=== 增量：恢复上次编译树 ==="
+          else
+            tar xf linux-6.12.115.tar.gz
+            echo "=== 首次：全新编译树 ==="
+          fi
           echo "KERNEL_VERSION=$(make -C linux-6.12.115 -s kernelversion)" >> "$GITHUB_ENV"
 
       - name: Install board dts
@@ -61,6 +75,9 @@ jobs:
             -j2 Image.gz dtbs modules
           echo "=== 内核编译完成，Module.symvers 已生成 ==="
           ls -lh $K/Module.symvers
+
+      - name: Pack build tree for next run
+        run: tar cf build-tree.tar linux-6.12.115
 
       - name: Build CONSYS WiFi modules (out-of-tree)
         run: |
