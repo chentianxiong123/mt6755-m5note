@@ -905,7 +905,7 @@ int mtk_p2p_cfg80211_disassoc(struct wiphy *wiphy, struct net_device *dev, struc
 int mtk_p2p_cfg80211_remain_on_channel(struct wiphy *wiphy,
 				       struct wireless_dev *wdev,
 				       struct ieee80211_channel *chan,
-				       unsigned int duration, u64 cookie,
+				       unsigned int duration, u64 *cookie,
 				       const u8 *rx_addr)
 {
 	INT_32 i4Rslt = -EINVAL;
@@ -932,7 +932,8 @@ int mtk_p2p_cfg80211_remain_on_channel(struct wiphy *wiphy,
 		DBGLOG(P2P, TRACE, "mtk_p2p_cfg80211_remain_on_channel\n");
 
 		prMsgChnlReq->rMsgHdr.eMsgId = MID_MNY_P2P_CHNL_REQ;
-		prMsgChnlReq->u8Cookie = cookie;
+				*cookie = prGlueP2pInfo->u8Cookie++;
+		prMsgChnlReq->u8Cookie = *cookie;
 		prMsgChnlReq->u4Duration = duration;
 
 		mtk_p2p_cfg80211func_channel_format_switch(chan, NL80211_CHAN_HT20,	/* 4 KH Need Check */
@@ -951,7 +952,7 @@ int mtk_p2p_cfg80211_remain_on_channel(struct wiphy *wiphy,
 /* mtk_p2p_cfg80211_remain_on_channel */
 int mtk_p2p_cfg80211_cancel_remain_on_channel(struct wiphy *wiphy,
 					      struct wireless_dev *wdev,
-					      u64 cookie)
+					      u64 *cookie)
 {
 	INT_32 i4Rslt = -EINVAL;
 	P_GLUE_INFO_T prGlueInfo = (P_GLUE_INFO_T) NULL;
@@ -974,7 +975,8 @@ int mtk_p2p_cfg80211_cancel_remain_on_channel(struct wiphy *wiphy,
 		DBGLOG(P2P, TRACE, "mtk_p2p_cfg80211_cancel_remain_on_channel\n");
 
 		prMsgChnlAbort->rMsgHdr.eMsgId = MID_MNY_P2P_CHNL_ABORT;
-		prMsgChnlAbort->u8Cookie = cookie;
+				*cookie = prGlueP2pInfo->u8Cookie++;
+		prMsgChnlAbort->u8Cookie = *cookie;
 
 		mboxSendMsg(prGlueInfo->prAdapter, MBOX_ID_0, (P_MSG_HDR_T) prMsgChnlAbort, MSG_SEND_METHOD_BUF);
 
@@ -987,7 +989,7 @@ int mtk_p2p_cfg80211_cancel_remain_on_channel(struct wiphy *wiphy,
 int mtk_p2p_cfg80211_mgmt_tx(struct wiphy *wiphy,
 			     struct wireless_dev *wdev,
 			     struct cfg80211_mgmt_tx_params *params,
-			     u64 cookie)
+			     u64 *cookie)
 {
 	P_GLUE_INFO_T prGlueInfo = (P_GLUE_INFO_T) NULL;
 	P_GL_P2P_INFO_T prGlueP2pInfo = (P_GL_P2P_INFO_T) NULL;
@@ -1038,7 +1040,8 @@ int mtk_p2p_cfg80211_mgmt_tx(struct wiphy *wiphy,
 			break;
 		}
 
-		prMsgTxReq->u8Cookie = cookie;
+				*cookie = prGlueP2pInfo->u8Cookie++;
+		prMsgTxReq->u8Cookie = *cookie;
 		prMsgTxReq->rMsgHdr.eMsgId = MID_MNY_P2P_MGMT_TX;
 
 		pucFrameBuf = (PUINT_8) ((ULONG) prMgmtFrame->prPacket + MAC_TX_RESERVED_FIELD);

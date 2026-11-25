@@ -1480,7 +1480,7 @@ void mtk_cfg80211_update_mgmt_frame_registrations(IN struct wiphy *wiphy,
 int mtk_cfg80211_remain_on_channel(struct wiphy *wiphy,
 				   struct wireless_dev *wdev,
 				   struct ieee80211_channel *chan,
-				   unsigned int duration, u64 cookie,
+				   unsigned int duration, u64 *cookie,
 				   const u8 *rx_addr)
 {
 	P_GLUE_INFO_T prGlueInfo = NULL;
@@ -1509,7 +1509,8 @@ int mtk_cfg80211_remain_on_channel(struct wiphy *wiphy,
 		kalMemZero(prMsgChnlReq, sizeof(MSG_REMAIN_ON_CHANNEL_T));
 
 		prMsgChnlReq->rMsgHdr.eMsgId = MID_MNY_AIS_REMAIN_ON_CHANNEL;
-		prMsgChnlReq->u8Cookie = cookie;
+				*cookie = prGlueInfo->u8Cookie++;
+		prMsgChnlReq->u8Cookie = *cookie;
 		prMsgChnlReq->u4DurationMs = duration;
 
 		prMsgChnlReq->ucChannelNum = nicFreq2ChannelNum(chan->center_freq * 1000);
@@ -1547,7 +1548,7 @@ int mtk_cfg80211_remain_on_channel(struct wiphy *wiphy,
 /*----------------------------------------------------------------------------*/
 int mtk_cfg80211_cancel_remain_on_channel(struct wiphy *wiphy,
 					  struct wireless_dev *wdev,
-					  u64 cookie)
+					  u64 *cookie)
 {
 	P_GLUE_INFO_T prGlueInfo = NULL;
 	INT_32 i4Rslt = -EINVAL;
@@ -1574,7 +1575,8 @@ int mtk_cfg80211_cancel_remain_on_channel(struct wiphy *wiphy,
 		}
 
 		prMsgChnlAbort->rMsgHdr.eMsgId = MID_MNY_AIS_CANCEL_REMAIN_ON_CHANNEL;
-		prMsgChnlAbort->u8Cookie = cookie;
+				*cookie = prGlueInfo->u8Cookie++;
+		prMsgChnlAbort->u8Cookie = *cookie;
 
 		mboxSendMsg(prGlueInfo->prAdapter, MBOX_ID_0, (P_MSG_HDR_T) prMsgChnlAbort, MSG_SEND_METHOD_BUF);
 
@@ -1598,7 +1600,7 @@ int
 mtk_cfg80211_mgmt_tx(struct wiphy *wiphy,
 		     struct wireless_dev *wdev,
 		     struct cfg80211_mgmt_tx_params *params,
-		     u64 cookie)
+		     u64 *cookie)
 {
 	P_GLUE_INFO_T prGlueInfo = NULL;
 	INT_32 i4Rslt = -EINVAL;
@@ -1638,7 +1640,8 @@ mtk_cfg80211_mgmt_tx(struct wiphy *wiphy,
 			break;
 		}
 
-		prMsgTxReq->u8Cookie = cookie;
+				*cookie = prGlueInfo->u8Cookie++;
+		prMsgTxReq->u8Cookie = *cookie;
 		prMsgTxReq->rMsgHdr.eMsgId = MID_MNY_AIS_MGMT_TX;
 
 		pucFrameBuf = (PUINT_8) ((ULONG) prMgmtFrame->prPacket + MAC_TX_RESERVED_FIELD);
@@ -1675,7 +1678,7 @@ mtk_cfg80211_mgmt_tx(struct wiphy *wiphy,
 /*----------------------------------------------------------------------------*/
 int mtk_cfg80211_mgmt_tx_cancel_wait(struct wiphy *wiphy,
 				     struct wireless_dev *wdev,
-				     u64 cookie)
+				     u64 *cookie)
 {
 	P_GLUE_INFO_T prGlueInfo = NULL;
 
