@@ -1,0 +1,14 @@
+Fix: sizeof() on flexible-array sa_data (6.12 DECLARE_FLEX_ARRAY)
+
+struct sockaddr in 6.x uses DECLARE_FLEX_ARRAY(char, sa_data), so
+sizeof(MacAddr.sa_data) is invalid. Use the 14-byte sa_data_min size.
+
+--- a/wlan/os/linux/gl_init.c
++++ b/wlan/os/linux/gl_init.c
+@@ -3148,7 +3148,7 @@
+ 			UINT_32 u4SetInfoLen = 0;
+ 
+-			kalMemZero(MacAddr.sa_data, sizeof(MacAddr.sa_data));
++			kalMemZero(MacAddr.sa_data, 14);
+ 			rStatus = kalIoctl(prGlueInfo,
+ 					   wlanoidQueryCurrentAddr,

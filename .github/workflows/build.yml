@@ -66,6 +66,8 @@ jobs:
         run: |
           K=$PWD/linux-6.12.115
           cd mainline/wifi
+          # 6.12 兼容补丁：sizeof(flexible array sa_data)
+          patch -p1 < ../patches/wifi/fix-sockaddr-sa_data.patch
           make KDIR=$K ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONSYS_PLAT=mt6755
           echo "=== CONSYS 模块 ==="
           find . -name "*.ko" -exec ls -lh {} \;
