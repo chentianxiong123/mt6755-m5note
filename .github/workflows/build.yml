@@ -1,12 +1,7 @@
 name: build-mt6755-m5note
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'mainline/**'
-      - '.github/workflows/build.yml'
+  workflow_dispatch:          # 仅手动触发；push 不自动跑，避免误触发
 
 jobs:
   build:
@@ -20,9 +15,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison libssl-dev bc kmod cpio
 
+      - name: Cache kernel tarball
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: linux-6.12.115.tar.gz
+          key: kernel-tarball-6.12.115
+
       - name: Download kernel 6.12.115
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: wget -q https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/linux-6.12.115.tar.gz
+
+      - name: Extract kernel
         run: |
-          wget -q https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/linux-6.12.115.tar.gz
           tar xf linux-6.12.115.tar.gz
           echo "KERNEL_VERSION=$(make -C linux-6.12.115 -s kernelversion)" >> "$GITHUB_ENV"
 
@@ -33,7 +38,6 @@ jobs:
           MK=$K/arch/arm64/boot/dts/mediatek/Makefile
           grep -q "mt6755-m5note.dtb" "$MK" || \
             sed -i "/mt6755-evb.dtb/a dtb-\$(CONFIG_ARCH_MEDIATEK) += mt6755-m5note.dtb" "$MK"
-          # LK merges odmdtbo overlay -> needs __symbols__
           echo 'DTC_FLAGS_mt6755-m5note := -@' >> "$MK"
 
       - name: Install driver patches
@@ -43,13 +47,23 @@ jobs:
              mainline/patches/pinctrl-mtk-mt6755.h $K/drivers/pinctrl/mediatek/
           cp mainline/patches/i2c-mt65xx.c $K/drivers/i2c/busses/
           cp mainline/patches/phy-mtk-tphy.c $K/drivers/phy/mediatek/
-          cp mainline/patches/psci.c $K/drivers/firmware/
+          # psci.c 不覆盖：主线 6.12 用 drivers/firmware/psci/psci.c，
+          # dts 里是标准 arm,psci-0.2，无需 yao 的补丁版。
 
       - name: Configure
         run: |
           K=linux-6.12.115
+          test -f mainline/config/m5note.config || { echo "config missing!"; exit 1; }
           cp mainline/config/m5note.config $K/.config
           make -C $K ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      - name: Cache build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            linux-6.12.115/.config
+            linux-6.12.115/arch/arm64/boot
+          key: build-m5note-${{ hashFiles('mainline/config/m5note.config', 'mainline/dts/mt6755-m5note.dts', 'mainline/patches/**') }}
 
       - name: Build
         run: |

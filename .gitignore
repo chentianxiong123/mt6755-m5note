@@ -7,3 +7,7 @@
 *.zip
 *.tgz
 .DS_Store
+
+# CI kernel config must be tracked
+!mainline/config/
+!mainline/config/**
