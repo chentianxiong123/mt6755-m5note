@@ -13,3 +13,4 @@
 !mainline/config/**
 !mainline/7.3.1/config/
 !mainline/7.3.1/config/**
+release/*.img
