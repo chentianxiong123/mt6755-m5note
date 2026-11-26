@@ -46,7 +46,6 @@ jobs:
         run: |
           # build.sh expects $TOP/linux and $TOP/out; stage build.sh next to linux/
           cp mainline/7.3.1/build.sh .
-          cp mainline/7.3.1/config/kernel-7.3.1.config /tmp/reference.config
           sed -i 's|^SRC=$TOP/linux OUT=$TOP/out|SRC=$TOP/linux OUT=$TOP/out|' build.sh
           chmod +x build.sh
 
@@ -62,13 +61,6 @@ jobs:
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           ./build.sh
           echo "=== Image.gz-dtb ==="; ls -lh out/Image.gz-dtb
-
-      - name: Build modules
-        run: |
-          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-          make -C linux O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            modules INSTALL_MOD_PATH=$PWD/out/modules INSTALL_MOD_STRIP=1 modules_install >/dev/null 2>&1
-          echo "=== modules ==="; ls out/modules/lib/modules/ | head
 
       - name: Build CONSYS WiFi modules (out-of-tree, 7.3.1 native)
         run: |
