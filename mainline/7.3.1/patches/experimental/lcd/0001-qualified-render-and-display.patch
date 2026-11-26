@@ -1,0 +1,2635 @@
+From: pminervini <227357+pminervini@users.noreply.github.com>
+Subject: [PATCH] MT6750: qualify retained graphics, framebuffer handover, and battery acquisition
+
+Apply after the tablet base through patch 0033 (kernel base 976d4857a991).
+Keep simplefb for early boot and load the separately named simpledrm driver only
+under the file-lifetime handover controller. No live GPU DVFS or resource release
+is introduced. The PMIC acquisition correction preserves real temperature stops.
+
+diff --git a/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml b/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
+@@ -51,6 +51,7 @@
+           - const: arm,mali-t830
+       - items:
+           - enum:
++              - mediatek,mt6750-mali
+               - rockchip,rk3399-mali
+           - const: arm,mali-t860
+       - items:
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -628,3 +628,44 @@
+ 	/* CNTFRQ is not reliably programmed by this firmware (stock DT sets it) */
+ 	clock-frequency = <13000000>;
+ };
++
++/* Experimental render-only integration; the inherited framebuffer is unchanged. */
++/ {
++	mfg_retained: system-controller@13000000 {
++		compatible = "mediatek,mt6750-mfg-retained";
++		reg = <0 0x13000000 0 0x200>,
++		      <0 0x1000c000 0 0x1000>,
++		      <0 0x10000000 0 0x1000>,
++		      <0 0x10006000 0 0x1000>,
++		      <0 0x10001000 0 0x1000>,
++		      <0 0x14000000 0 0x1000>,
++		      <0 0x1000cf00 0 0x100>;
++		reg-names = "mfg", "apmixed", "topckgen", "spm", "infracfg",
++			    "mmsys", "fhctl";
++		clocks = <&uart_clk>;
++		clock-names = "ref";
++		#clock-cells = <0>;
++		#power-domain-cells = <0>;
++	};
++
++	gpu_opp_table: opp-table-gpu {
++		compatible = "operating-points-v2";
++
++		opp-351000000 {
++			opp-hz = /bits/ 64 <351000000>;
++		};
++	};
++
++	gpu: gpu@13040000 {
++		compatible = "mediatek,mt6750-mali", "arm,mali-t860";
++		reg = <0 0x13040000 0 0x4000>;
++		interrupts = <GIC_SPI 218 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_SPI 217 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_SPI 216 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-names = "job", "mmu", "gpu";
++		clocks = <&mfg_retained>;
++		clock-names = "core";
++		power-domains = <&mfg_retained>;
++		operating-points-v2 = <&gpu_opp_table>;
++	};
++};
+diff --git a/drivers/clk/mediatek/Kconfig b/drivers/clk/mediatek/Kconfig
+--- a/drivers/clk/mediatek/Kconfig
++++ b/drivers/clk/mediatek/Kconfig
+@@ -17,6 +17,18 @@
+ 	help
+ 	  This driver supports MediaTek frequency hopping and
+ 	  spread spectrum clocking features.
++
++config COMMON_CLK_MT6750_MFG_RETAINED
++	bool "MT6750 k50v1 fixed-state retained MFG provider"
++	depends on ARCH_MEDIATEK && ARM64 && OF && PM_GENERIC_DOMAINS
++	depends on COMMON_CLK_MEDIATEK && MFD_SYSCON
++	help
++	  Experimental fixed 351 MHz GPU clock and power-domain integration for
++	  k50v1. Requires recognized inherited supply, isolation and inactive
++	  FHCTL routing. Cold entry may initialize only gated/reset channel 4;
++	  unsupported entry states are rejected before writes.
++	  Retains admitted external resources until reboot and vetoes unsupported
++	  system sleep. No voltage scaling or external runtime power-off.
+ 
+ config COMMON_CLK_MT2701
+ 	bool "Clock driver for MediaTek MT2701"
+diff --git a/drivers/clk/mediatek/Makefile b/drivers/clk/mediatek/Makefile
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -173,3 +173,5 @@
+ obj-$(CONFIG_COMMON_CLK_MT8365_VENC) += clk-mt8365-venc.o
+ obj-$(CONFIG_COMMON_CLK_MT8516) += clk-mt8516-apmixedsys.o clk-mt8516.o
+ obj-$(CONFIG_COMMON_CLK_MT8516_AUDSYS) += clk-mt8516-aud.o
++
++obj-$(CONFIG_COMMON_CLK_MT6750_MFG_RETAINED) += clk-mt6750-mfg-retained.o
+diff --git a/drivers/gpu/drm/sysfb/simpledrm.c b/drivers/gpu/drm/sysfb/simpledrm.c
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/aperture.h>
++#include <video/fb_handover.h>
+ #include <linux/clk.h>
+ #include <linux/minmax.h>
+ #include <linux/of_address.h>
+@@ -887,7 +888,23 @@
+ 
+ DEFINE_DRM_GEM_FOPS(simpledrm_fops);
+ 
++DEFINE_FB_HANDOVER_GATE(simpledrm_clients);
++module_param_cb(handover_blocked, &fb_handover_ops, &simpledrm_clients, 0600);
++MODULE_PARM_DESC(handover_blocked, "Block new DRM opens only when no DRM file lifetime remains");
++
++static int simpledrm_user_open(struct drm_device *dev, struct drm_file *file)
++{
++	return fb_handover_open(&simpledrm_clients);
++}
++
++static void simpledrm_user_close(struct drm_device *dev, struct drm_file *file)
++{
++	fb_handover_close(&simpledrm_clients);
++}
++
+ static struct drm_driver simpledrm_driver = {
++	.open = simpledrm_user_open,
++	.postclose = simpledrm_user_close,
+ 	DRM_GEM_SHMEM_DRIVER_OPS,
+ 	DRM_FBDEV_SHMEM_DRIVER_OPS,
+ 	.name			= DRIVER_NAME,
+@@ -958,7 +975,7 @@
+ 
+ static struct platform_driver simpledrm_platform_driver = {
+ 	.driver = {
+-		.name = "simple-framebuffer", /* connect to sysfb */
++		.name = "simpledrm-display", /* distinct platform name; DRM identity unchanged */
+ 		.of_match_table = simpledrm_of_match_table,
+ 		.pm = pm_sleep_ptr(&simpledrm_pm_ops),
+ 	},
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1762,7 +1762,8 @@
+ config FB_SIMPLE
+ 	tristate "Simple framebuffer support"
+ 	depends on FB
+-	depends on !DRM_SIMPLEDRM
++	# The modular DRM driver has a distinct platform registration name.
++	depends on DRM_SIMPLEDRM != y
+ 	select APERTURE_HELPERS
+ 	select FB_IOMEM_HELPERS
+ 	help
+diff --git a/drivers/video/fbdev/simplefb.c b/drivers/video/fbdev/simplefb.c
+--- a/drivers/video/fbdev/simplefb.c
++++ b/drivers/video/fbdev/simplefb.c
+@@ -27,6 +27,23 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/regulator/consumer.h>
++#include <video/fb_handover.h>
++
++DEFINE_FB_HANDOVER_GATE(simplefb_clients);
++module_param_cb(handover_blocked, &fb_handover_ops, &simplefb_clients, 0600);
++MODULE_PARM_DESC(handover_blocked, "Block new user opens only when no user file lifetime remains");
++
++static int simplefb_user_open(struct fb_info *info, int user)
++{
++	return user ? fb_handover_open(&simplefb_clients) : 0;
++}
++
++static int simplefb_user_release(struct fb_info *info, int user)
++{
++	if (user)
++		fb_handover_close(&simplefb_clients);
++	return 0;
++}
+ 
+ static const struct fb_fix_screeninfo simplefb_fix = {
+ 	.id		= "simple",
+@@ -117,6 +134,8 @@
+ }
+ 
+ static const struct fb_ops simplefb_ops = {
++	.fb_open = simplefb_user_open,
++	.fb_release = simplefb_user_release,
+ 	.owner		= THIS_MODULE,
+ 	FB_DEFAULT_IOMEM_OPS,
+ 	.fb_destroy	= simplefb_destroy,
+diff --git a/Documentation/devicetree/bindings/clock/mediatek,mt6750-mfg-retained.yaml b/Documentation/devicetree/bindings/clock/mediatek,mt6750-mfg-retained.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/clock/mediatek,mt6750-mfg-retained.yaml
+@@ -0,0 +1,72 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/clock/mediatek,mt6750-mfg-retained.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6750 retained MFG clock and power controller
++
++maintainers:
++  - Pasquale Minervini <p.minervini@gmail.com>
++
++description: |
++  Board-specific first-bring-up integration of MT6750 MFG with its GPU-only
++  MMPLL, MFG mux and gate, paired async/main power islands, shared display/SMI
++  prerequisites and read-only shared MT6353 VCORE admission. Other consumers of
++  the shared register banks remain outside this controller's writable fields.
++  The controller retains qualified physical resources and exposes one core
++  clock and one composite GPU power domain. Cold entry may initialize only
++  FHCTL channel 4 without selecting FHCTL control or enabling hopping/SSC.
++  After complete cold admission, a consistent unprotected-off handoff may
++  establish MFG-only bus protection with checked acknowledgement before power
++  restoration. All shared-word writes finish synchronously before publication;
++  a failed attempted write quarantines retained state without rollback/retry.
++  It does not implement voltage scaling or external runtime power-off.
++
++properties:
++  compatible:
++    const: mediatek,mt6750-mfg-retained
++
++  reg:
++    items:
++      - description: MFG configuration and gate registers
++      - description: APMIXED MMPLL register bank
++      - description: TOPCKGEN GPU mux and update registers
++      - description: SPM power and status registers
++      - description: INFRACFG bus protection registers
++      - description: MMSYS shared SMI clock status registers
++      - description: FHCTL global and GPU channel registers
++
++  reg-names:
++    items:
++      - const: mfg
++      - const: apmixed
++      - const: topckgen
++      - const: spm
++      - const: infracfg
++      - const: mmsys
++      - const: fhctl
++
++  clocks:
++    maxItems: 1
++
++  clock-names:
++    items:
++      - const: ref
++
++  "#clock-cells":
++    const: 0
++
++  "#power-domain-cells":
++    const: 0
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - clocks
++  - clock-names
++  - "#clock-cells"
++  - "#power-domain-cells"
++
++additionalProperties: false
+diff --git a/drivers/clk/mediatek/clk-mt6750-mfg-sequence-test.c b/drivers/clk/mediatek/clk-mt6750-mfg-sequence-test.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6750-mfg-sequence-test.c
+@@ -0,0 +1,697 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Host-only mock driver I/O tests of the production shared transaction.
++ * clang -std=c11 -Wall -Wextra -Werror -O2 clk-mt6750-mfg-sequence-test.c -o test
++ * These checks are NOT firmware emulation or hardware qualification.
++ */
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "clk-mt6750-mfg-sequence.h"
++
++enum fault {
++	NONE, ASYNC_ACK1, ASYNC_ACK2, MAIN_ACK1, MAIN_ACK2,
++	SRAM_ACK, PROTECTION_ACK, TOP_ACK, GATE_ACK
++};
++struct event { char kind; enum mfg_bank bank; u32 off, val; };
++struct mock {
++	u32 regs[MFG_PMIC + 1][0x1000 / 4];
++	struct event events[40000];
++	unsigned int count, reads, writes, channel_reads, off_mfg_reads;
++	unsigned int fail_read, fail_write;
++	enum fault fault;
++	bool mutate_read, mutate_sticky;
++	enum mfg_bank mutate_bank;
++	u32 mutate_off, mutate_xor;
++	unsigned int mutate_occurrence, occurrence;
++	bool fh_locked, qualified_clk, qualified_rst;
++	unsigned int locks, unlocks;
++	u32 fh_before[3];
++};
++static unsigned int checks, cases, rejected;
++#define CHECK(x) do { checks++; if (!(x)) { \
++	fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); abort(); } } while (0)
++
++static void event(struct mock *m, char kind, enum mfg_bank b, u32 o, u32 v)
++{
++	assert(m->count < sizeof(m->events) / sizeof(m->events[0]));
++	m->events[m->count++] = (struct event){kind, b, o, v};
++}
++
++static int mock_read(void *ctx, enum mfg_bank b, u32 o, u32 *v)
++{
++	struct mock *m = ctx;
++
++	assert(b <= MFG_PMIC && o < 0x1000 && !(o & (b == MFG_PMIC ? 1 : 3)));
++	m->reads++;
++	assert(!m->fh_locked || b == MFG_FH);
++	if (b == MFG_FH && o >= 0x88) {
++		assert(m->qualified_clk && m->qualified_rst);
++		assert((m->regs[MFG_FH][1] & m->regs[MFG_FH][2] & MFG_BIT(4)));
++		m->channel_reads++;
++	}
++	if (b == MFG_MFG &&
++	    ((m->regs[MFG_SPM][0x180 / 4] & MFG_GPU_STATUS) != MFG_GPU_STATUS ||
++	     (m->regs[MFG_SPM][0x184 / 4] & MFG_GPU_STATUS) != MFG_GPU_STATUS))
++		m->off_mfg_reads++;
++	if (m->fail_read == m->reads) {
++		event(m, 'E', b, o, 0);
++		return -EIO;
++	}
++	/* PMIC offsets can be 2-byte aligned; use a separate halfword index. */
++	*v = m->regs[b][o / (b == MFG_PMIC ? 2 : 4)];
++	if (m->mutate_read && b == m->mutate_bank && o == m->mutate_off) {
++		m->occurrence++;
++		if (m->occurrence == m->mutate_occurrence ||
++		    (m->mutate_sticky && m->occurrence > m->mutate_occurrence))
++			*v ^= m->mutate_xor;
++	}
++	if (b == MFG_FH && o == 4) m->qualified_clk = !!(*v & MFG_BIT(4));
++	if (b == MFG_FH && o == 8) m->qualified_rst = !!(*v & MFG_BIT(4));
++	event(m, 'R', b, o, *v);
++	return 0;
++}
++
++static int mock_write(void *ctx, enum mfg_bank b, u32 o, u32 v)
++{
++	struct mock *m = ctx;
++	u32 bit;
++
++	m->writes++;
++	event(m, 'W', b, o, v);
++	if (m->fail_write == m->writes)
++		return -EIO;
++	assert(b != MFG_PMIC && b != MFG_MM);
++	assert(m->fh_locked == (b == MFG_FH));
++	if (b == MFG_FH) {
++		assert(o == 4 || o == 8 || (!v && (o == 0x88 || o == 0x8c || o == 0x90)));
++		if (o == 4) m->qualified_clk = false;
++		if (o == 8) m->qualified_rst = false;
++	}
++	m->regs[b][o / 4] = v;
++	/* Mock only the documented driver-I/O ACK contract; no instruction,
++	 * firmware, bus, GPU command, clock waveform or electrical execution.
++	 */
++	if (b == MFG_SPM && (o == 0x334 || o == 0x338)) {
++		bit = o == 0x334 ? MFG_BIT(23) : MFG_BIT(4);
++		if ((v & 0xc) == 0xc) {
++			if (!((o == 0x334 && m->fault == ASYNC_ACK1) ||
++			      (o == 0x338 && m->fault == MAIN_ACK1)))
++				m->regs[MFG_SPM][0x180 / 4] |= bit;
++			if (!((o == 0x334 && m->fault == ASYNC_ACK2) ||
++			      (o == 0x338 && m->fault == MAIN_ACK2)))
++				m->regs[MFG_SPM][0x184 / 4] |= bit;
++		}
++		if (o == 0x338 && !(v & MFG_BIT(8)) && m->fault != SRAM_ACK)
++			m->regs[b][o / 4] &= ~MFG_BIT(16);
++	}
++	if (b == MFG_TOP && o == 0x58 && m->fault != TOP_ACK)
++		m->regs[b][0x50 / 4] &= ~v;
++	if (b == MFG_TOP && o == 0x54 && m->fault != TOP_ACK)
++		m->regs[b][0x50 / 4] |= v;
++	if (b == MFG_INFRA && o == 0x220 && m->fault != PROTECTION_ACK)
++		m->regs[b][0x228 / 4] = v;
++	if (b == MFG_MFG && o == 8 && m->fault != GATE_ACK)
++		m->regs[b][0] &= ~v;
++	return 0;
++}
++
++static void mock_delay(void *ctx, unsigned int us)
++{
++	struct mock *m = ctx;
++	assert(!m->fh_locked);
++	event(ctx, 'D', MFG_BANKS, 0, us);
++}
++
++static unsigned long mock_lock_fh(void *ctx)
++{
++	struct mock *m = ctx;
++	assert(!m->fh_locked && !m->locks && !m->writes);
++	/* Complete two-pass rail/FH/cold/display/PLL/mux admission first. */
++	assert(m->reads == 64);
++	m->fh_before[0] = m->regs[MFG_FH][1];
++	m->fh_before[1] = m->regs[MFG_FH][2];
++	m->fh_before[2] = m->regs[MFG_FH][0];
++	m->fh_locked = true;
++	m->locks++;
++	event(m, 'L', MFG_FH, 0, 0);
++	return 0x12345678UL;
++}
++
++static void mock_unlock_fh(void *ctx, unsigned long flags)
++{
++	struct mock *m = ctx;
++	assert(m->fh_locked && flags == 0x12345678UL);
++	m->fh_locked = false;
++	m->unlocks++;
++	event(m, 'U', MFG_FH, 0, 0);
++}
++
++static void initial(struct mock *m, struct mfg_sequence *s,
++		    struct mfg_profile *p, bool pll_on, bool bootstrap)
++{
++	unsigned int i;
++
++	memset(m, 0, sizeof(*m));
++	memset(s, 0, sizeof(*s));
++	memset(p, 0, sizeof(*p));
++	p->exact_machine = p->exact_binding = true;
++	p->ref_hz = MFG_REF_RATE;
++	for (i = 0; i < MFG_BANKS; i++) {
++		p->start[i] = mfg_region_start[i];
++		p->size[i] = mfg_region_size[i];
++	}
++	m->regs[MFG_PMIC][0x628 / 2] = 0x10;
++	m->regs[MFG_PMIC][0x62c / 2] = 0x3001;
++	m->regs[MFG_PMIC][0x630 / 2] = 0x38;
++	m->regs[MFG_PMIC][0x632 / 2] = 0x38;
++	m->regs[MFG_PMIC][0x638 / 2] = 0x63;
++	m->regs[MFG_FH][4 / 4] = 0x10010;
++	m->regs[MFG_FH][8 / 4] = 0x20010;
++	m->regs[MFG_FH][0x88 / 4] = 0x80000000;
++	/* Nonzero retained DDS/latch is deliberately accepted and untouched. */
++	m->regs[MFG_FH][0x90 / 4] = 0x80140000;
++	m->regs[MFG_SPM][0x180 / 4] = 0x100008;
++	m->regs[MFG_SPM][0x184 / 4] = 0x100008;
++	m->regs[MFG_SPM][0x334 / 4] = 0x80000012;
++	m->regs[MFG_SPM][0x338 / 4] = 0x80010112;
++	m->regs[MFG_SPM][0x30c / 4] = 0x8000000d;
++	m->regs[MFG_INFRA][0x220 / 4] = 0x00402000 | MFG_PROTECT;
++	m->regs[MFG_INFRA][0x228 / 4] = 0x00402000 | MFG_PROTECT;
++	m->regs[MFG_MM][0x100 / 4] = 0x12345678;
++	m->regs[MFG_TOP][0x50 / 4] = 0xa1123456;
++	m->regs[MFG_APMIXED][0x240 / 4] = 0xa0000000 | (pll_on ? 1 : 0);
++	m->regs[MFG_APMIXED][0x244 / 4] = 0xc0000000 | MFG_DIV2 | MFG_PCW520;
++	m->regs[MFG_APMIXED][0x24c / 4] = 0x100 | (pll_on ? 1 : 2);
++	m->regs[MFG_MFG][0] = 0xfeed0001;
++	/* Shared CPU/MAINPLL/display/mm_sel fields are sentinels. */
++	m->regs[MFG_APMIXED][0x200 / 4] = 0xdecaf001;
++	m->regs[MFG_APMIXED][0x210 / 4] = 0xdecaf002;
++	m->regs[MFG_APMIXED][0x220 / 4] = 0xdecaf003;
++	if (bootstrap) {
++		m->regs[MFG_FH][1] &= ~MFG_BIT(4);
++		m->regs[MFG_FH][2] &= ~MFG_BIT(4);
++		/* Unknown inherited CFG must not be read before establishment. */
++		m->regs[MFG_FH][0x88 / 4] = 0xffffffff;
++		m->regs[MFG_FH][0x8c / 4] = 0x12345678;
++	}
++	s->io = (struct mfg_io){m, mock_read, mock_write, mock_delay,
++		mock_lock_fh, mock_unlock_fh};
++}
++
++
++static void invariant_writes(struct mock *m)
++{
++	static const u32 fh_offsets[] = {4, 8, 8, 0x88, 0x8c, 0x90};
++	unsigned int i, fh_writes = 0, locked_events = 0;
++	bool locked = false, read_error = false;
++
++	CHECK(!m->off_mfg_reads);
++	CHECK(!m->fh_locked && m->locks == m->unlocks && m->locks <= 1);
++	for (i = 0; i < m->count; i++) {
++		struct event *e = &m->events[i];
++		bool ok = false;
++
++		if (read_error) CHECK(e->kind == 'U');
++		if (e->kind == 'E') read_error = true;
++		if (e->kind == 'L') { CHECK(!locked); locked = true; }
++		if (e->kind == 'U') { CHECK(locked); locked = false; }
++		if (locked) { CHECK(e->bank == MFG_FH); locked_events++; }
++		if (e->kind != 'W')
++			continue;
++		CHECK(e->bank != MFG_PMIC && e->bank != MFG_MM);
++		switch (e->bank) {
++		case MFG_FH:
++			CHECK(locked && fh_writes < 6);
++			CHECK(e->off == fh_offsets[fh_writes]);
++			if (fh_writes < 3)
++				CHECK(e->val == (m->fh_before[fh_writes ? 1 : 0] |
++				      (fh_writes == 1 ? 0 : MFG_BIT(4))));
++			else CHECK(!e->val);
++			fh_writes++;
++			ok = true;
++			break;
++		case MFG_APMIXED:
++			ok = e->off == 0x240 || e->off == 0x244 || e->off == 0x24c;
++			break;
++		case MFG_TOP:
++			ok = (e->off == 0x58 && e->val == 0x83000000) ||
++			     (e->off == 0x54 && e->val == 0x01000000) ||
++			     (e->off == 4 && e->val == MFG_BIT(7));
++			break;
++		case MFG_SPM:
++			ok = (e->off == 0 && e->val == 0x0b160001) ||
++			     e->off == 0x334 || e->off == 0x338;
++			break;
++		case MFG_INFRA:
++			ok = e->off == 0x220 && e->val == 0x00402000;
++			break;
++		case MFG_MFG:
++			ok = (e->off == 8 && e->val == 1) ||
++			     (e->off == 0x1c && e->val == 7);
++			break;
++		default:
++			break;
++		}
++		CHECK(ok);
++	}
++	CHECK(!locked && locked_events < 64);
++}
++
++static void unchanged(struct mock *m, struct mock *before)
++{
++	unsigned int b, i;
++
++	for (b = 0; b <= MFG_PMIC; b++)
++		for (i = 0; i < 0x1000 / 4; i++) {
++			u32 mask = 0;
++			if (m->locks && b == MFG_FH && (i == 1 || i == 2)) mask = MFG_BIT(4);
++			if (m->locks && b == MFG_FH && (i == 0x88 / 4 || i == 0x8c / 4 || i == 0x90 / 4)) mask = ~0U;
++			if (b == MFG_APMIXED && i == 0x240 / 4) mask = 1;
++			if (b == MFG_APMIXED && i == 0x244 / 4) mask = MFG_PCW_MASK | MFG_DIV_MASK;
++			if (b == MFG_APMIXED && i == 0x24c / 4) mask = 3;
++			if (b == MFG_TOP && i == 0x50 / 4) mask = 0x83000000;
++			if (b == MFG_TOP && (i == 4 / 4 || i == 0x54 / 4 || i == 0x58 / 4)) mask = ~0U;
++			if (b == MFG_SPM && i == 0) mask = ~0U;
++			if (b == MFG_SPM && (i == 0x180 / 4 || i == 0x184 / 4)) mask = MFG_GPU_STATUS;
++			if (b == MFG_SPM && i == 0x334 / 4) mask = MFG_CTL_MASK;
++			if (b == MFG_SPM && i == 0x338 / 4) mask = MFG_CTL_MASK | MFG_BIT(8) | MFG_BIT(16);
++			if (b == MFG_INFRA && (i == 0x220 / 4 || i == 0x228 / 4)) mask = MFG_PROTECT;
++			if (b == MFG_MFG && (i == 0 || i == 8 / 4)) mask = 1;
++			if (b == MFG_MFG && i == 0x1c / 4) mask = ~0U;
++			CHECK(!((m->regs[b][i] ^ before->regs[b][i]) & ~mask));
++		}
++}
++
++static void rejection(struct mock *m, struct mfg_sequence *s, struct mfg_profile *p)
++{
++	unsigned int reads;
++
++	cases++; rejected++;
++	CHECK(mfg_run(s, p) < 0);
++	CHECK(!m->writes && !s->mutated && !s->held && !s->quarantined);
++	CHECK(!m->off_mfg_reads);
++	CHECK(!m->fh_locked && m->locks == m->unlocks);
++	reads = m->reads;
++	CHECK(mfg_run(s, p) == -EALREADY);
++	CHECK(m->reads == reads && !m->writes);
++}
++
++static void write_prefix(struct mock *m, struct mock *good)
++{
++	unsigned int i, j = 0;
++
++	for (i = 0; i < m->count; i++) {
++		struct event *e = &m->events[i];
++		if (e->kind != 'W')
++			continue;
++		while (j < good->count && good->events[j].kind != 'W')
++			j++;
++		CHECK(j < good->count);
++		CHECK(e->bank == good->events[j].bank &&
++		      e->off == good->events[j].off && e->val == good->events[j].val);
++		j++;
++	}
++}
++
++static void order(struct mock *m, bool on)
++{
++	/* Expected SOURCE recipe writes, independent of mock ACK updates. */
++	struct event expect[] = {
++		{'W', MFG_APMIXED, 0x240, 0xa0000000},
++		{'W', MFG_APMIXED, 0x24c, 0x103},
++		{'W', MFG_APMIXED, 0x24c, 0x102},
++		{'W', MFG_APMIXED, 0x244, 0xc20d8000},
++		{'W', MFG_APMIXED, 0x24c, 0x103},
++		{'D', MFG_BANKS, 0, 1},
++		{'W', MFG_APMIXED, 0x24c, 0x101},
++		{'D', MFG_BANKS, 0, 1},
++		{'W', MFG_APMIXED, 0x240, 0xa0000001},
++		{'D', MFG_BANKS, 0, 20},
++		{'W', MFG_TOP, 0x58, 0x83000000},
++		{'W', MFG_TOP, 0x54, 0x01000000},
++		{'W', MFG_TOP, 4, 0x80},
++		{'W', MFG_SPM, 0, 0x0b160001},
++		{'W', MFG_SPM, 0x334, 0x80000016},
++		{'W', MFG_SPM, 0x334, 0x8000001e},
++		{'W', MFG_SPM, 0x334, 0x8000000e},
++		{'W', MFG_SPM, 0x334, 0x8000000c},
++		{'W', MFG_SPM, 0x334, 0x8000000d},
++		{'W', MFG_SPM, 0, 0x0b160001},
++		{'W', MFG_SPM, 0x338, 0x80010116},
++		{'W', MFG_SPM, 0x338, 0x8001011e},
++		{'W', MFG_SPM, 0x338, 0x8001010e},
++		{'W', MFG_SPM, 0x338, 0x8001010c},
++		{'W', MFG_SPM, 0x338, 0x8001010d},
++		{'W', MFG_SPM, 0x338, 0x8001000d},
++		{'W', MFG_INFRA, 0x220, 0x00402000},
++		{'W', MFG_MFG, 8, 1},
++		{'W', MFG_MFG, 0x1c, 7},
++	};
++	unsigned int i, n = on ? 0 : 3, fh_writes = 0;
++
++	for (i = 0; i < m->count; i++) {
++		struct event *e = &m->events[i];
++		if (e->kind == 'W' && e->bank == MFG_FH) { fh_writes++; continue; }
++		if (e->kind != 'W' && e->kind != 'D') continue;
++		CHECK(fh_writes == (m->locks ? 6U : 0U));
++		CHECK(n < sizeof(expect) / sizeof(expect[0]));
++		CHECK(e->kind == expect[n].kind && e->bank == expect[n].bank &&
++		      e->off == expect[n].off && e->val == expect[n].val);
++		n++;
++	}
++	CHECK(n == sizeof(expect) / sizeof(expect[0]));
++}
++
++static void test_route(struct mock *m, struct mock *before, struct mock *good,
++		       bool route)
++{
++	struct mfg_sequence s;
++	struct mfg_profile p;
++	unsigned int i, b, bit, good_reads, good_writes;
++	unsigned int first_case = cases, first_reject = rejected;
++	int ret;
++
++	for (i = 0; i < 3; i++) {
++		initial(m, &s, &p, i != 1, route);
++		if (i == 2) m->regs[MFG_APMIXED][0x244 / 4] = 0xc20d8000;
++		*before = *m;
++		cases++;
++		CHECK(!mfg_run(&s, &p));
++		CHECK(s.held && s.mutated && !s.quarantined);
++		if (i < 2) order(m, i == 0);
++		invariant_writes(m);
++		unchanged(m, before);
++		CHECK(!mfg_running(&s));
++		CHECK(mfg_run(&s, &p) == -EALREADY);
++	}
++	initial(m, &s, &p, true, route);
++	CHECK(!mfg_run(&s, &p));
++	good_reads = m->reads;
++	good_writes = m->writes;
++	*good = *m;
++
++	/* Supported endpoint rails and genuine reference mux entry. */
++	for (i = 0; i < 2; i++) {
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_PMIC][0x630 / 2] = i ? 0x40 : 0x30;
++		m->regs[MFG_PMIC][0x632 / 2] = i ? 0x40 : 0x30;
++		m->regs[MFG_TOP][0x50 / 4] &= ~0x03000000U;
++		cases++;
++		CHECK(!mfg_run(&s, &p) && s.held && !s.quarantined);
++		invariant_writes(m);
++	}
++
++	for (i = 0; i < 3; i++) {
++		initial(m, &s, &p, true, route);
++		if (i == 0) p.exact_machine = false;
++		if (i == 1) p.exact_binding = false;
++		if (i == 2) p.ref_hz++;
++		rejection(m, &s, &p);
++		CHECK(!m->reads);
++	}
++	for (b = 0; b < MFG_BANKS; b++) {
++		initial(m, &s, &p, true, route); p.start[b]++;
++		rejection(m, &s, &p); CHECK(!m->reads);
++		initial(m, &s, &p, true, route); p.size[b]++;
++		rejection(m, &s, &p); CHECK(!m->reads);
++	}
++	/* Wrong rail controls, enables, selector correspondence/range and each
++	 * DVS/sleep bit are individually exercised, not collapsed into one test.
++	 */
++	for (i = 0; i < 14; i++) {
++		static const unsigned int sleep_bits[] = {7, 8, 10, 11, 14, 15};
++		initial(m, &s, &p, true, route);
++		if (i < 2) m->regs[MFG_PMIC][0x628 / 2] |= MFG_BIT(i);
++		else if (i == 2) m->regs[MFG_PMIC][0x62c / 2] &= ~1U;
++		else if (i == 3) m->regs[MFG_PMIC][0x62c / 2] &= ~MFG_BIT(13);
++		else if (i == 4) m->regs[MFG_PMIC][0x630 / 2]++;
++		else if (i == 5 || i == 6) {
++			m->regs[MFG_PMIC][0x630 / 2] = i == 5 ? 0x2f : 0x41;
++			m->regs[MFG_PMIC][0x632 / 2] = i == 5 ? 0x2f : 0x41;
++		} else if (i == 7) m->regs[MFG_PMIC][0x638 / 2] |= 0xcd80;
++		else m->regs[MFG_PMIC][0x638 / 2] |= MFG_BIT(sleep_bits[i - 8]);
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < 5; i++) {
++		static const u32 rail[] = {0x628, 0x62c, 0x630, 0x632, 0x638};
++		initial(m, &s, &p, true, route);
++		m->mutate_read = true; m->mutate_bank = MFG_PMIC;
++		m->mutate_off = rail[i]; m->mutate_occurrence = 2; m->mutate_xor = 1;
++		rejection(m, &s, &p);
++	}
++	/* Mixed gate/reset rejects; 0/0 is now software establishment. */
++	for (i = 0; i < 3; i++) {
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_FH][4 / 4] = (i & 1) ? 0x10 : 0;
++		m->regs[MFG_FH][8 / 4] = (i & 2) ? 0x10 : 0;
++		if (!i) {
++			cases++;
++			CHECK(!mfg_run(&s, &p) && s.held && m->locks == 1);
++			invariant_writes(m);
++		} else {
++			rejection(m, &s, &p);
++			CHECK(!m->channel_reads);
++		}
++	}
++	for (i = 0; i < (route ? 1U : 4U); i++) {
++		initial(m, &s, &p, true, route);
++		if (!i) m->regs[MFG_FH][0] = 0x10;
++		else m->regs[MFG_FH][0x88 / 4] |= MFG_BIT(i - 1);
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < (route ? 3U : 4U); i++) {
++		static const u32 fh[] = {4, 8, 0, 0x88};
++		initial(m, &s, &p, true, route);
++		m->mutate_read = true; m->mutate_bank = MFG_FH;
++		m->mutate_off = fh[i]; m->mutate_occurrence = 2; m->mutate_xor = 0x10;
++		rejection(m, &s, &p);
++	}
++	/* Both status words, both island bits: any live/mixed state rejects. */
++	for (i = 0; i < 2; i++) for (bit = 0; bit < 2; bit++) {
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_SPM][(0x180 + i * 4) / 4] |= MFG_BIT(bit ? 23 : 4);
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < 5; i++) {
++		initial(m, &s, &p, true, route); m->regs[MFG_SPM][0x334 / 4] ^= MFG_BIT(i);
++		rejection(m, &s, &p);
++		initial(m, &s, &p, true, route); m->regs[MFG_SPM][0x338 / 4] ^= MFG_BIT(i);
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < 2; i++) {
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_SPM][0x338 / 4] ^= MFG_BIT(i ? 16 : 8);
++		rejection(m, &s, &p);
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_INFRA][(i ? 0x228 : 0x220) / 4] &= ~MFG_PROTECT;
++		rejection(m, &s, &p);
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_SPM][(0x180 + i * 4) / 4] &= ~MFG_BIT(3);
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < 7; i++) {
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_SPM][0x30c / 4] ^= MFG_BIT(i < 5 ? i : i == 5 ? 8 : 12);
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < 3; i++) {
++		initial(m, &s, &p, true, route);
++		if (i < 2) m->regs[MFG_INFRA][(i ? 0x228 : 0x220) / 4] |= MFG_BIT(1);
++		else m->regs[MFG_MM][0x100 / 4] |= 1;
++		rejection(m, &s, &p);
++	}
++	for (i = 0; i < 5; i++) {
++		initial(m, &s, &p, true, route);
++		if (i < 2) m->regs[MFG_APMIXED][0x24c / 4] ^= MFG_BIT(i);
++		else if (i == 2) m->regs[MFG_APMIXED][0x244 / 4] ^= 1;
++		else if (i == 3) m->regs[MFG_APMIXED][0x244 / 4] ^= MFG_BIT(24);
++		else m->regs[MFG_APMIXED][0x240 / 4] &= ~1U;
++		rejection(m, &s, &p);
++	}
++	for (i = 2; i < 4; i++) {
++		initial(m, &s, &p, true, route);
++		m->regs[MFG_TOP][0x50 / 4] = i << 24;
++		rejection(m, &s, &p);
++	}
++	/* Recognized encodings which change across the two snapshots reject. */
++	for (i = 0; i < 2; i++) {
++		initial(m, &s, &p, true, route);
++		m->mutate_read = true;
++		m->mutate_bank = i ? MFG_TOP : MFG_APMIXED;
++		m->mutate_off = i ? 0x50 : 0x244;
++		m->mutate_occurrence = 2;
++		m->mutate_xor = i ? MFG_BIT(24) : (MFG_PCW520 ^ MFG_PCW351);
++		rejection(m, &s, &p);
++	}
++
++	/* All documented ACK failure sites: BOTH words separately, SRAM,
++	 * protection release, mux and physical gate. Every timeout quarantines
++	 * without cleanup/retry or any later write.
++	 */
++	for (i = ASYNC_ACK1; i <= GATE_ACK; i++) {
++		unsigned int writes;
++		initial(m, &s, &p, true, route); m->fault = i; *before = *m;
++		cases++;
++		CHECK(mfg_run(&s, &p) == -ETIMEDOUT);
++		CHECK(s.mutated && s.quarantined && !s.held);
++		CHECK(m->count < 10000);
++		writes = m->writes;
++		CHECK(mfg_run(&s, &p) == -EALREADY && m->writes == writes);
++		invariant_writes(m); unchanged(m, before); write_prefix(m, good);
++	}
++	/* Inject an I/O error at EVERY read and EVERY write in the successful
++	 * production transaction, including PMIC transport and final admission.
++	 */
++	for (i = 1; i <= good_reads; i++) {
++		unsigned int reads, writes;
++		initial(m, &s, &p, true, route); m->fail_read = i; *before = *m;
++		cases++;
++		ret = mfg_run(&s, &p);
++		CHECK(ret == -EIO);
++		CHECK(!s.held && s.quarantined == s.mutated);
++		reads = m->reads; writes = m->writes;
++		CHECK(reads == i);
++		CHECK(mfg_run(&s, &p) == -EALREADY);
++		CHECK(m->reads == reads && m->writes == writes);
++		invariant_writes(m); unchanged(m, before); write_prefix(m, good);
++	}
++	for (i = 1; i <= good_writes; i++) {
++		initial(m, &s, &p, true, route); m->fail_write = i; *before = *m;
++		cases++;
++		CHECK(mfg_run(&s, &p) == -EIO);
++		CHECK(s.mutated && s.quarantined && !s.held && m->writes == i);
++		CHECK(mfg_run(&s, &p) == -EALREADY && m->writes == i);
++		invariant_writes(m); unchanged(m, before); write_prefix(m, good);
++	}
++	printf("PASS route %s: %u cases, %u admission rejections; "
++	       "exhaustive %u read/%u write failure sites; "
++	       "ON520/OFF/ON351 and 8 ACK timeouts.\n",
++	       route ? "bootstrap" : "accessible", cases - first_case,
++	       rejected - first_reject, good_reads, good_writes);
++}
++
++static void bootstrap_checks(struct mock *m, struct mock *before, struct mock *good)
++{
++	static const struct { enum mfg_bank bank; u32 off, occurrence, bit; } cold[] = {
++		{MFG_PMIC, 0x628, 3, 1},
++		{MFG_SPM, 0x180, 3, MFG_BIT(4)},
++		{MFG_SPM, 0x184, 3, MFG_BIT(23)},
++		{MFG_SPM, 0x334, 2, 1}, {MFG_SPM, 0x338, 2, MFG_BIT(8)},
++		{MFG_INFRA, 0x220, 3, MFG_PROTECT},
++		{MFG_INFRA, 0x228, 3, MFG_PROTECT},
++		{MFG_SPM, 0x30c, 2, 1}, {MFG_MM, 0x100, 2, 1},
++		{MFG_APMIXED, 0x244, 2, 1}, {MFG_TOP, 0x50, 2, MFG_BIT(24)}
++	};
++	struct mfg_sequence s;
++	struct mfg_profile p;
++	u32 seed = 0xcafef00d;
++	unsigned int route, i, j, k, variant, writes, locks;
++
++	for (route = 0; route < 2; route++) {
++		/* Every relevant late admission family still rejects before FH writes. */
++		for (i = 0; i < sizeof(cold) / sizeof(cold[0]); i++) {
++			initial(m, &s, &p, true, route);
++			m->mutate_read = true; m->mutate_bank = cold[i].bank;
++			m->mutate_off = cold[i].off; m->mutate_occurrence = cold[i].occurrence;
++			m->mutate_xor = cold[i].bit;
++			rejection(m, &s, &p);
++		}
++		/* Both internally stable snapshots can differ: reject across passes. */
++		for (i = 0; i < 3; i++) {
++			initial(m, &s, &p, true, route);
++			m->mutate_read = m->mutate_sticky = true; m->mutate_bank = MFG_FH;
++			m->mutate_off = i * 4; m->mutate_occurrence = route ? 3 : 5;
++			m->mutate_xor = 0x100;
++			rejection(m, &s, &p);
++		}
++		/* Whole-bank peer sentinels, including all-zero/all-one global peers. */
++		for (i = 0; i < 34; i++) {
++			initial(m, &s, &p, i % 3 != 1, route);
++			if (i % 3 == 2) m->regs[MFG_APMIXED][0x244 / 4] = 0xc20d8000;
++			for (j = 0; j < 0x100 / 4; j++) {
++				seed = seed * 1664525U + 1013904223U;
++				m->regs[MFG_FH][j] = i < 2 ? (i ? ~0U : 0) : seed;
++			}
++			m->regs[MFG_FH][0] &= ~MFG_BIT(4);
++			m->regs[MFG_FH][1] = (m->regs[MFG_FH][1] & ~MFG_BIT(4)) |
++				(route ? 0 : MFG_BIT(4));
++			m->regs[MFG_FH][2] = (m->regs[MFG_FH][2] & ~MFG_BIT(4)) |
++				(route ? 0 : MFG_BIT(4));
++			if (!route) m->regs[MFG_FH][0x88 / 4] &= ~7U;
++			*before = *m;
++			cases++;
++			CHECK(!mfg_run(&s, &p) && s.held && !s.quarantined);
++			CHECK(s.fh_entry[0] == before->regs[MFG_FH][1] &&
++			      s.fh_entry[1] == before->regs[MFG_FH][2] &&
++			      s.fh_entry[2] == before->regs[MFG_FH][0]);
++			CHECK(m->locks == route);
++			if (route) CHECK(!m->regs[MFG_FH][0x88 / 4] &&
++				!m->regs[MFG_FH][0x8c / 4] && !m->regs[MFG_FH][0x90 / 4]);
++			invariant_writes(m); unchanged(m, before);
++			writes = m->writes; locks = m->locks;
++			CHECK(!mfg_running(&s) && m->writes == writes && m->locks == locks);
++		}
++		/* Running checks remain strict/read-only; they never bootstrap again. */
++		for (i = 0; i < 4; i++) {
++			static const u32 off[] = {4, 8, 0, 0x88};
++			initial(m, &s, &p, true, route);
++			CHECK(!mfg_run(&s, &p));
++			m->regs[MFG_FH][off[i] / 4] ^= i == 3 ? 1 : MFG_BIT(4);
++			writes = m->writes; locks = m->locks;
++			cases++;
++			CHECK(mfg_running(&s) == -EINVAL);
++			CHECK(m->writes == writes && m->locks == locks);
++		}
++		/* Corrupt EVERY successful FH read: gate/reset/clear readbacks,
++		 * HP or peer changes, including the lock-entry and final checks.
++		 */
++		initial(good, &s, &p, true, route);
++		CHECK(!mfg_run(&s, &p));
++		{
++			unsigned int occurrence[0x100 / 4] = {0};
++			for (i = 0; i < good->count; i++) {
++				struct event *e = &good->events[i];
++				if (e->kind != 'R' || e->bank != MFG_FH) continue;
++				occurrence[e->off / 4]++;
++				for (variant = 0; variant < (e->off < 12 ? 2U : 1U); variant++) {
++					unsigned int seen = 0;
++					initial(m, &s, &p, true, route);
++					m->mutate_read = true; m->mutate_bank = MFG_FH;
++					m->mutate_off = e->off;
++					m->mutate_occurrence = occurrence[e->off / 4];
++					m->mutate_xor = e->off < 12 ? (variant ? 0x100 : MFG_BIT(4)) : 1;
++					*before = *m;
++					cases++;
++					CHECK(mfg_run(&s, &p) == -EINVAL);
++					CHECK(!s.held && s.quarantined == s.mutated);
++					CHECK(m->occurrence >= m->mutate_occurrence);
++					for (j = 0; j < m->count; j++) {
++						if (m->events[j].kind == 'R' && m->events[j].bank == MFG_FH &&
++						    m->events[j].off == e->off) seen++;
++						if (seen >= m->mutate_occurrence) CHECK(m->events[j].kind != 'W');
++					}
++					writes = m->writes; k = m->reads;
++					CHECK(mfg_run(&s, &p) == -EALREADY);
++					CHECK(m->writes == writes && m->reads == k);
++					invariant_writes(m); unchanged(m, before); write_prefix(m, good);
++				}
++			}
++		}
++	}
++}
++
++int main(void)
++{
++	struct mock *m = calloc(1, sizeof(*m)), *before = calloc(1, sizeof(*before));
++	struct mock *good = calloc(1, sizeof(*good));
++
++	CHECK(m && before && good);
++	test_route(m, before, good, false);
++	test_route(m, before, good, true);
++	bootstrap_checks(m, before, good);
++	printf("PASS: %u cases; %u assertions; %u admission rejections; "
++	       "no off-MFG reads/PMIC/display/forbidden FH writes.\n", cases, checks, rejected);
++	free(good); free(before); free(m);
++	return 0;
++}
+diff --git a/drivers/clk/mediatek/clk-mt6750-mfg-retained.c b/drivers/clk/mediatek/clk-mt6750-mfg-retained.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6750-mfg-retained.c
+@@ -0,0 +1,660 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* MT6750 exact-board, fixed-351 MHz retained MFG resources.
++ *
++ * Not a GPU driver: upstream Panfrost owns GPU commands, IRQs and internal PM.
++ * This built-in owner performs ONE synchronous checked cold transaction after
++ * PMIC subsys init and before normal userspace can load the external WMT module.
++ * Only the admitted one-shot FHCTL channel-4 bootstrap may write FHCTL.
++ * No runtime physical-off, deferred retry, removal or PMIC write.
++ * Retention costs idle power; suspend/hibernate/restore are unsupported.
++ */
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/compiler.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/notifier.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/suspend.h>
++
++#include "clk-gate.h"
++#include "clk-mtk.h"
++#include "clk-pll.h"
++#include "clk-mt6750-mfg-sequence.h"
++
++/* Existing serialized native API; never create a second PWRAP owner. */
++extern int mt6755_pmic_read(u16 adr, u16 *val);
++
++struct mt6750_mfg {
++	struct device *dev;
++	struct device_node *np;
++	void __iomem *base[MFG_BANKS];
++	struct mfg_sequence seq;
++	raw_spinlock_t fh_lock;
++	struct clk *ref;
++	struct clk *leases[3];
++	struct clk_hw *pll;
++	struct clk_hw mux;
++	struct mtk_pll_data pll_data;
++	struct clk_hw_onecell_data *gates;
++	struct regmap *mfg_map;
++	struct generic_pm_domain display;
++	struct generic_pm_domain gpu;
++	struct notifier_block pm_nb;
++};
++
++/* Permanent built-in owner: deliberately not in a Panfrost devm scope. */
++static struct mt6750_mfg *mfg_owner;
++
++static int mt6750_read(void *ctx, enum mfg_bank bank, u32 off, u32 *value)
++{
++	struct mt6750_mfg *mfg = ctx;
++	u16 v;
++	int ret;
++
++	if (bank == MFG_PMIC) {
++		ret = mt6755_pmic_read(off, &v);
++		if (!ret)
++			*value = v;
++		return ret;
++	}
++	if (bank >= MFG_BANKS || off > mfg_region_size[bank] - 4 || (off & 3))
++		return -EINVAL;
++	*value = readl(mfg->base[bank] + off);
++	return 0;
++}
++
++static int mt6750_write(void *ctx, enum mfg_bank bank, u32 off, u32 value)
++{
++	struct mt6750_mfg *mfg = ctx;
++	bool allowed = false;
++
++	/* Defense in depth: no supply, shared PLL or display writes. */
++	switch (bank) {
++	case MFG_FH:
++		lockdep_assert_held(&mfg->fh_lock);
++		allowed = mfg->seq.stage == 14 && !mfg->seq.held &&
++			(off == 4 || off == 8 ||
++			 (!value && (off == 0x88 || off == 0x8c || off == 0x90)));
++		break;
++	case MFG_APMIXED:
++		allowed = off == 0x240 || off == 0x244 || off == 0x24c;
++		break;
++	case MFG_TOP:
++		allowed = off == 0x58 || off == 0x54 || off == 4;
++		break;
++	case MFG_SPM:
++		allowed = off == 0 || off == 0x334 || off == 0x338;
++		break;
++	case MFG_INFRA:
++		allowed = off == 0x220 && !mfg->seq.held && !(value & MFG_BIT(1)) &&
++			((mfg->seq.stage == 11 && !(value & MFG_PROTECT)) ||
++			 (mfg->seq.stage == 15 && mfg->seq.mutated &&
++			  mfg->seq.quarantined && (value & MFG_PROTECT)));
++		break;
++	case MFG_MFG:
++		allowed = off == 8 || off == 0x1c;
++		break;
++	default:
++		break;
++	}
++	if (WARN_ON_ONCE(!allowed))
++		return -EPERM;
++	writel(value, mfg->base[bank] + off);
++	/* Exact stock FH/SPM/protection recipes order writes with dsb sy. */
++	mb();
++	return 0;
++}
++
++static void mt6750_delay(void *ctx, unsigned int us)
++{
++	udelay(us);
++}
++
++static unsigned long mt6750_lock_fh(void *ctx)
++{
++	struct mt6750_mfg *mfg = ctx;
++	unsigned long flags;
++
++	/* This owner's serialization only; not a firmware/hardware semaphore. */
++	raw_spin_lock_irqsave(&mfg->fh_lock, flags);
++	return flags;
++}
++
++static void mt6750_unlock_fh(void *ctx, unsigned long flags)
++{
++	struct mt6750_mfg *mfg = ctx;
++
++	raw_spin_unlock_irqrestore(&mfg->fh_lock, flags);
++}
++
++static int mt6750_pm_event(struct notifier_block *nb, unsigned long event,
++			   void *unused)
++{
++	struct mt6750_mfg *mfg = container_of(nb, struct mt6750_mfg, pm_nb);
++
++	switch (event) {
++	case PM_SUSPEND_PREPARE:
++	case PM_HIBERNATION_PREPARE:
++	case PM_RESTORE_PREPARE:
++		if (mfg->seq.mutated || mfg->seq.held || READ_ONCE(mfg->seq.quarantined))
++			return NOTIFY_BAD;
++		break;
++	default:
++		break;
++	}
++	return NOTIFY_OK;
++}
++
++/* These callbacks never repair a changed state. An unexpected readback latches
++ * quarantine. Crucially no PLL enable/disable or TOP/INFRA write can occur here.
++ */
++static int mt6750_pll_check(struct clk_hw *hw)
++{
++	struct mt6750_mfg *mfg = mfg_owner;
++	int ret = READ_ONCE(mfg->seq.quarantined) ? -EIO : mfg_pll351(&mfg->seq);
++
++	if (ret)
++		WRITE_ONCE(mfg->seq.quarantined, true);
++	return ret;
++}
++
++static int mt6750_pll_is_prepared(struct clk_hw *hw)
++{
++	return !mt6750_pll_check(hw);
++}
++
++static unsigned long mt6750_pll_rate(struct clk_hw *hw, unsigned long parent)
++{
++	if (parent != MFG_REF_RATE || mt6750_pll_check(hw))
++		return 0;
++	/* Native helper decodes the real PCW and postdivider, not a fixed alias. */
++	return mtk_pll_recalc_rate(hw, parent);
++}
++
++static int mt6750_pll_determine(struct clk_hw *hw, struct clk_rate_request *req)
++{
++	if (req->rate != MFG_RATE || req->min_rate > MFG_RATE ||
++	    req->max_rate < MFG_RATE || mt6750_pll_check(hw))
++		return -EINVAL;
++	req->rate = MFG_RATE;
++	req->best_parent_rate = MFG_REF_RATE;
++	req->best_parent_hw = clk_hw_get_parent(hw);
++	return 0;
++}
++
++static int mt6750_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++			      unsigned long parent)
++{
++	if (rate != MFG_RATE || parent != MFG_REF_RATE)
++		return -EINVAL;
++	return mt6750_pll_check(hw);
++}
++
++static const struct clk_ops mt6750_fixed_pll_ops = {
++	.prepare = mt6750_pll_check,
++	.is_prepared = mt6750_pll_is_prepared,
++	.recalc_rate = mt6750_pll_rate,
++	.determine_rate = mt6750_pll_determine,
++	.set_rate = mt6750_pll_set_rate,
++	/* No unprepare: permanently retained even after partial publication. */
++};
++
++static u8 mt6750_mux_parent(struct clk_hw *hw)
++{
++	u32 v = readl(mfg_owner->base[MFG_TOP] + 0x50);
++	u8 parent = (v >> 24) & 3;
++
++	/* Do not alias univpll/syspll into the two supported physical inputs. */
++	return parent <= 1 ? parent : 0xff;
++}
++
++static int mt6750_mux_check(struct clk_hw *hw)
++{
++	struct mt6750_mfg *mfg = mfg_owner;
++	int ret;
++
++	if (READ_ONCE(mfg->seq.quarantined))
++		return -EIO;
++	ret = mfg_expect(&mfg->seq, MFG_TOP, 0x50, 0x83000000, 0x01000000);
++	if (ret)
++		WRITE_ONCE(mfg->seq.quarantined, true);
++	return ret;
++}
++
++static unsigned long mt6750_mux_rate(struct clk_hw *hw, unsigned long parent)
++{
++	if (parent != MFG_RATE || mt6750_mux_check(hw))
++		return 0;
++	return mt6750_pll_rate(mfg_owner->pll, MFG_REF_RATE);
++}
++
++static int mt6750_mux_determine(struct clk_hw *hw, struct clk_rate_request *req)
++{
++	if (req->rate != MFG_RATE || req->min_rate > MFG_RATE ||
++	    req->max_rate < MFG_RATE || mt6750_mux_check(hw))
++		return -EINVAL;
++	req->rate = MFG_RATE;
++	req->best_parent_rate = MFG_RATE;
++	req->best_parent_hw = clk_hw_get_parent_by_index(hw, 1);
++	return 0;
++}
++
++static int mt6750_mux_set_rate(struct clk_hw *hw, unsigned long rate,
++			      unsigned long parent)
++{
++	if (rate != MFG_RATE || parent != MFG_RATE)
++		return -EINVAL;
++	return mt6750_mux_check(hw);
++}
++
++static const struct clk_ops mt6750_retained_mux_ops = {
++	.prepare = mt6750_mux_check,
++	.get_parent = mt6750_mux_parent,
++	.recalc_rate = mt6750_mux_rate,
++	.determine_rate = mt6750_mux_determine,
++	.set_rate = mt6750_mux_set_rate,
++	/* Read-only mux: no set_parent and no runtime TOP writes. */
++};
++
++static const struct mtk_gate_regs mt6750_gate_regs = {
++	.sta_ofs = 0, .set_ofs = 4, .clr_ofs = 8,
++};
++
++static int mt6750_gate_enable(struct clk_hw *hw)
++{
++	int ret = mt6750_pll_check(mfg_owner->pll);
++
++	if (ret)
++		return ret;
++	ret = mt6750_mux_check(&mfg_owner->mux);
++	if (ret)
++		return ret;
++	ret = mtk_clk_gate_ops_setclr.enable(hw);
++	if (ret)
++		return ret;
++	ret = mfg_poll(&mfg_owner->seq, MFG_MFG, 0, 1, 0);
++	if (ret)
++		WRITE_ONCE(mfg_owner->seq.quarantined, true);
++	return ret;
++}
++
++static int mt6750_gate_is_enabled(struct clk_hw *hw)
++{
++	return mtk_clk_gate_ops_setclr.is_enabled(hw);
++}
++
++static void mt6750_gate_disable(struct clk_hw *hw)
++{
++	/* An independent critical lease exists; even erroneous framework
++	 * teardown must not turn off a quarantined or retained physical leaf.
++	 */
++}
++
++static const struct clk_ops mt6750_retained_gate_ops = {
++	.enable = mt6750_gate_enable,
++	.disable = mt6750_gate_disable,
++	.is_enabled = mt6750_gate_is_enabled,
++	.recalc_rate = mt6750_mux_rate,
++};
++
++static const struct mtk_gate mt6750_gate = {
++	.id = 0, .name = "mt6750_mfg_core", .parent_name = "mt6750_mfg_sel",
++	.regs = &mt6750_gate_regs, .shift = 0,
++	.ops = &mt6750_retained_gate_ops,
++	.flags = CLK_IS_CRITICAL | CLK_GET_RATE_NOCACHE,
++};
++
++static int mt6750_domain_off(struct generic_pm_domain *domain)
++{
++	/* Even a framework misuse must not cross the unsafe physical-off gate. */
++	return -EBUSY;
++}
++
++static int mt6750_display_on(struct generic_pm_domain *domain)
++{
++	return mfg_display(&mfg_owner->seq);
++}
++
++static int mt6750_gpu_on(struct generic_pm_domain *domain)
++{
++	struct mfg_sequence *s = &mfg_owner->seq;
++	int ret = READ_ONCE(s->quarantined) ? -EIO : mfg_running(s);
++
++	if (ret)
++		WRITE_ONCE(s->quarantined, true);
++	return ret ? ret : (READ_ONCE(s->quarantined) ? -EIO : 0);
++}
++
++/* Retained clocks/domains skip their physical enable callbacks. Validate at
++ * the actual consumer boundaries, before probe and every runtime resume.
++ * PMIC reads sleep: reject an IRQ-safe consumer before the first read.
++ */
++static int mt6750_gpu_start(struct device *dev)
++{
++	if (pm_runtime_is_irq_safe(dev))
++		return -EINVAL;
++	return mt6750_gpu_on(&mfg_owner->gpu);
++}
++
++static int mt6750_gpu_attach(struct generic_pm_domain *domain, struct device *dev)
++{
++	return mt6750_gpu_start(dev);
++}
++
++static int mt6750_lease(struct mt6750_mfg *mfg, unsigned int index,
++			struct clk_hw *hw)
++{
++	int ret;
++
++	mfg->leases[index] = clk_hw_get_clk(hw, "retained-owner");
++	if (IS_ERR(mfg->leases[index]))
++		return PTR_ERR(mfg->leases[index]);
++	ret = clk_prepare_enable(mfg->leases[index]);
++	/* No unwind on failure: hardware transaction has already happened. */
++	return ret;
++}
++
++static int mt6750_publish(struct mt6750_mfg *mfg)
++{
++	const struct clk_hw *parents[2];
++	struct clk_init_data init = {};
++	const struct regmap_config map_config = {
++		.name = "mt6750-mfg-retained", .reg_bits = 32, .val_bits = 32,
++		.reg_stride = 4, .max_register = 0x1fc, .fast_io = true,
++	};
++	int ret;
++
++	mfg->pll_data = (struct mtk_pll_data) {
++		.id = 0, .name = "mt6750_mmpll", .reg = 0x240, .pwr_reg = 0x24c,
++		/* pll_en_bit=0 is the single real enable. No reset-bar/tuner. */
++		.pd_reg = 0x244, .pd_shift = 24, .pcw_reg = 0x244,
++		.pcwbits = 21, .pcwibits = 7, .fmax = 3000000000UL,
++		.flags = PLL_AO, .ops = &mt6750_fixed_pll_ops,
++		.parent_name = __clk_get_name(mfg->ref),
++	};
++	mfg->pll = mtk_clk_register_pll(mfg->dev, &mfg->pll_data,
++				      mfg->base[MFG_APMIXED]);
++	if (IS_ERR(mfg->pll))
++		return PTR_ERR(mfg->pll);
++	ret = mt6750_lease(mfg, 0, mfg->pll);
++	if (ret)
++		return ret;
++
++	parents[0] = __clk_get_hw(mfg->ref);
++	parents[1] = mfg->pll;
++	init.name = "mt6750_mfg_sel";
++	init.ops = &mt6750_retained_mux_ops;
++	init.parent_hws = parents;
++	init.num_parents = 2;
++	init.flags = CLK_IS_CRITICAL | CLK_GET_RATE_NOCACHE;
++	mfg->mux.init = &init;
++	ret = clk_hw_register(mfg->dev, &mfg->mux);
++	if (ret)
++		return ret;
++	ret = mt6750_lease(mfg, 1, &mfg->mux);
++	if (ret)
++		return ret;
++
++	/* Supply a real explicitly-owned MMIO regmap BEFORE the generic gate
++	 * helper calls device_node_to_regmap(). No generic syscon suffix and
++	 * no implicit input-clock/reset resource-management side effects.
++	 */
++	mfg->mfg_map = regmap_init_mmio(mfg->dev, mfg->base[MFG_MFG], &map_config);
++	if (IS_ERR(mfg->mfg_map))
++		return PTR_ERR(mfg->mfg_map);
++	ret = of_syscon_register_regmap(mfg->np, mfg->mfg_map);
++	if (ret)
++		return ret;
++	mfg->gates = mtk_alloc_clk_data(1);
++	if (!mfg->gates)
++		return -ENOMEM;
++	ret = mtk_clk_register_gates(mfg->dev, mfg->np, &mt6750_gate, 1, mfg->gates);
++	if (ret)
++		return ret;
++	ret = mt6750_lease(mfg, 2, mfg->gates->hws[0]);
++	if (ret)
++		return ret;
++	if (clk_get_rate(mfg->leases[2]) != MFG_RATE)
++		return -EINVAL;
++
++	/* This inherited domain represents REAL active DISP+SMI lifetimes;
++	 * there is no claim of CCF votes on absent mm_sel/SMI providers. It
++	 * never cycles those resources or attaches/re-probes the framebuffer.
++	 */
++	mfg->display.name = "mt6750-inherited-display-smi-retained";
++	mfg->display.flags = GENPD_FLAG_ALWAYS_ON;
++	mfg->display.power_on = mt6750_display_on;
++	mfg->display.power_off = mt6750_domain_off;
++	ret = pm_genpd_init(&mfg->display, NULL, false);
++	if (ret)
++		return ret;
++	mfg->gpu.name = "mt6750-mfg-async-main-retained";
++	mfg->gpu.flags = GENPD_FLAG_ALWAYS_ON;
++	mfg->gpu.power_on = mt6750_gpu_on;
++	mfg->gpu.power_off = mt6750_domain_off;
++	mfg->gpu.attach_dev = mt6750_gpu_attach;
++	mfg->gpu.dev_ops.start = mt6750_gpu_start;
++	ret = pm_genpd_init(&mfg->gpu, NULL, false);
++	if (ret)
++		return ret;
++	ret = pm_genpd_add_subdomain(&mfg->display, &mfg->gpu);
++	if (ret)
++		return ret;
++
++	ret = mfg_running(&mfg->seq);
++	if (ret)
++		return ret;
++	ret = of_clk_add_hw_provider(mfg->np, of_clk_hw_simple_get, mfg->gates->hws[0]);
++	if (ret)
++		return ret;
++	ret = of_genpd_add_provider_simple(mfg->np, &mfg->gpu);
++	if (ret)
++		of_clk_del_provider(mfg->np);
++	/* On a late error keep internal graph/leases and physical resources,
++	 * but no partial public OF consumer graph. Nothing powers hardware off.
++	 */
++	return ret;
++}
++
++static int mt6750_binding(struct device_node *np, struct mfg_profile *p)
++{
++	static const char * const names[MFG_BANKS] = {
++		"mfg", "apmixed", "topckgen", "spm", "infracfg", "mmsys", "fhctl"
++	};
++	static const char * const unsupported[] = {
++		"resets", "reset-names", "power-domains", "assigned-clocks",
++		"assigned-clock-parents", "assigned-clock-rates", "hwlocks",
++		"mediatek,hw-voter", "big-endian", "little-endian", "native-endian",
++		"reg-io-width", "vcore-supply", "mali-supply", "operating-points-v2"
++	};
++	struct resource res;
++	struct of_phandle_args args;
++	struct device_node *ref_np;
++	u32 value;
++	unsigned int i;
++	const char *name;
++	int ret;
++
++	p->exact_machine = of_machine_is_compatible("mediatek,k50v1-tablet");
++	p->exact_binding = of_property_count_strings(np, "compatible") == 1 &&
++		of_device_is_compatible(np, "mediatek,mt6750-mfg-retained");
++	if (!p->exact_machine || !p->exact_binding ||
++	    of_property_count_strings(np, "reg-names") != MFG_BANKS ||
++	    of_property_count_strings(np, "clock-names") != 1 ||
++	    of_property_read_string(np, "clock-names", &name) || strcmp(name, "ref"))
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(unsupported); i++)
++		if (of_property_present(np, unsupported[i]))
++			return -EINVAL;
++	if (of_property_read_u32(np, "#clock-cells", &value) || value ||
++	    of_property_read_u32(np, "#power-domain-cells", &value) || value)
++		return -EINVAL;
++	if (of_count_phandle_with_args(np, "clocks", "#clock-cells") != 1)
++		return -EINVAL;
++	ret = of_parse_phandle_with_args(np, "clocks", "#clock-cells", 0, &args);
++	if (ret)
++		return ret;
++	/* Actual board hardware reference, not an invented 351 MHz alias. */
++	ref_np = of_find_node_by_path("/dummy26m");
++	ret = !of_device_is_compatible(args.np, "fixed-clock") || args.args_count ||
++		args.np != ref_np ||
++		of_property_read_u32(args.np, "clock-frequency", &value) ||
++		value != MFG_REF_RATE;
++	of_node_put(ref_np);
++	of_node_put(args.np);
++	if (ret)
++		return -EINVAL;
++	for (i = 0; i < MFG_BANKS; i++) {
++		ret = of_property_read_string_index(np, "reg-names", i, &name);
++		if (ret || strcmp(name, names[i]) || of_address_to_resource(np, i, &res))
++			return -EINVAL;
++		p->start[i] = res.start;
++		if (resource_size(&res) != mfg_region_size[i])
++			return -EINVAL;
++		p->size[i] = resource_size(&res);
++	}
++	if (!of_address_to_resource(np, MFG_BANKS, &res))
++		return -EINVAL;
++	return 0;
++}
++
++/* Called only for this mfg_run() failure, after all sequencer locks return.
++ * Never re-read hardware, or attribute a runtime/publication error to this.
++ */
++static void mt6750_report_admission_failure(struct mt6750_mfg *mfg)
++{
++	const struct mfg_admission_failure *f = &mfg->seq.admission_failure;
++
++	if (!f->valid) {
++		dev_warn(mfg->dev, "admission detail unknown: pass/predicate/value/mask/expected not observed\n");
++		return;
++	}
++	if (f->read_error)
++		dev_warn(mfg->dev, "stage3 admission pass=%u bank=%u offset=0x%x mask=0x%08x expected=0x%08x value=unknown read_error=%d\n",
++			 f->pass, f->bank, f->offset, f->mask, f->expected,
++			 f->read_error);
++	else
++		dev_warn(mfg->dev, "stage3 admission pass=%u bank=%u offset=0x%x mask=0x%08x expected=0x%08x value=0x%08x masked=0x%08x read_error=0\n",
++			 f->pass, f->bank, f->offset, f->mask, f->expected,
++			 f->value, f->value & f->mask);
++}
++
++static int __init mt6750_mfg_retained_init(void)
++{
++	struct mfg_profile profile = {};
++	struct device_node *np, *other;
++	struct mt6750_mfg *mfg;
++	unsigned int i;
++	int ret;
++
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6750-mfg-retained");
++	if (!np)
++		return 0;
++	if (!of_device_is_available(np)) {
++		of_node_put(np);
++		return 0;
++	}
++	/* There is precisely one direct one-shot owner, never a deferred probe. */
++	other = of_find_compatible_node(of_node_get(np), NULL,
++				        "mediatek,mt6750-mfg-retained");
++	if (other) {
++		of_node_put(other);
++		of_node_put(np);
++		return -EINVAL;
++	}
++	ret = mt6750_binding(np, &profile);
++	if (ret)
++		goto put_node;
++	mfg = kzalloc(sizeof(*mfg), GFP_KERNEL);
++	if (!mfg) {
++		ret = -ENOMEM;
++		goto put_node;
++	}
++	mfg->np = np;
++	mfg->ref = of_clk_get_by_name(np, "ref");
++	if (IS_ERR(mfg->ref)) {
++		ret = PTR_ERR(mfg->ref);
++		goto free_owner;
++	}
++	profile.ref_hz = clk_get_rate(mfg->ref);
++	ret = mfg_profile_check(&profile);
++	if (ret)
++		goto put_ref;
++	/* No enable of the input clock before full hardware admission: it is
++	 * the existing fixed 26 MHz physical reference, verified above.
++	 */
++	for (i = 0; i < MFG_BANKS; i++) {
++		mfg->base[i] = ioremap(profile.start[i], profile.size[i]);
++		if (!mfg->base[i]) {
++			ret = -ENOMEM;
++			goto unmap;
++		}
++	}
++	mfg->dev = root_device_register("mt6750-mfg-retained");
++	if (IS_ERR(mfg->dev)) {
++		ret = PTR_ERR(mfg->dev);
++		goto unmap;
++	}
++	mfg->dev->of_node = of_node_get(np);
++	raw_spin_lock_init(&mfg->fh_lock);
++	mfg->seq.io = (struct mfg_io) {
++		.ctx = mfg, .read = mt6750_read, .write = mt6750_write,
++		.delay_us = mt6750_delay,
++		.lock_fh = mt6750_lock_fh, .unlock_fh = mt6750_unlock_fh,
++	};
++	mfg->pm_nb.notifier_call = mt6750_pm_event;
++	ret = register_pm_notifier(&mfg->pm_nb);
++	if (ret)
++		goto unregister_device;
++	mfg_owner = mfg;
++	ret = mfg_run(&mfg->seq, &profile);
++	if (ret)
++		mt6750_report_admission_failure(mfg);
++	if (ret && !mfg->seq.mutated) {
++		dev_warn(mfg->dev, "entry rejected before writes: %d stage %u\n",
++			 ret, mfg->seq.stage);
++		unregister_pm_notifier(&mfg->pm_nb);
++		mfg_owner = NULL;
++		goto unregister_device;
++	}
++	if (!ret)
++		ret = mt6750_publish(mfg);
++	if (ret) {
++		WRITE_ONCE(mfg->seq.quarantined, true);
++		dev_err(mfg->dev, "quarantined, retained; no public GPU graph: %d stage %u\n",
++			ret, mfg->seq.stage);
++		return ret;
++	}
++	dev_info(mfg->dev, "351 MHz admitted; physical clocks/islands/display retained; system sleep vetoed\n");
++	return 0;
++
++unregister_device:
++	of_node_put(mfg->dev->of_node);
++	mfg->dev->of_node = NULL;
++	root_device_unregister(mfg->dev);
++unmap:
++	for (i = 0; i < MFG_BANKS; i++)
++		if (mfg->base[i])
++			iounmap(mfg->base[i]);
++put_ref:
++	clk_put(mfg->ref);
++free_owner:
++	kfree(mfg);
++put_node:
++	of_node_put(np);
++	return ret;
++}
++fs_initcall(mt6750_mfg_retained_init);
+diff --git a/drivers/clk/mediatek/clk-mt6750-mfg-sequence.h b/drivers/clk/mediatek/clk-mt6750-mfg-sequence.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6750-mfg-sequence.h
+@@ -0,0 +1,636 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __CLK_MT6750_MFG_SEQUENCE_H
++#define __CLK_MT6750_MFG_SEQUENCE_H
++
++/* The production transaction and host mock-I/O tests use this same code.
++ * This is NOT a firmware emulator. Only documented GPU-local writes exist.
++ */
++#ifdef __KERNEL__
++#include <linux/errno.h>
++#include <linux/types.h>
++#else
++#include <stdbool.h>
++#include <stdint.h>
++#include <errno.h>
++typedef uint32_t u32;
++typedef uint64_t u64;
++#endif
++
++#define MFG_BIT(n) ((u32)1U << (n))
++#define MFG_RATE 351000000UL
++#define MFG_REF_RATE 26000000UL
++#define MFG_PCW_MASK 0x001fffffU
++#define MFG_DIV_MASK 0x07000000U
++#define MFG_PCW351 0x000d8000U
++#define MFG_PCW520 0x00140000U
++#define MFG_DIV2 0x02000000U /* encoding 2 means divide by FOUR */
++#define MFG_PROTECT MFG_BIT(21)
++#define MFG_GPU_STATUS (MFG_BIT(4) | MFG_BIT(23))
++#define MFG_CTL_MASK 0x1fU
++#define MFG_CTL_OFF 0x12U /* CLK_DIS, ISO; reset asserted, both power bits off */
++#define MFG_CTL_ON 0x0dU /* reset released, both power bits on */
++#define MFG_POLL_US 1000U
++
++enum mfg_bank { MFG_MFG, MFG_APMIXED, MFG_TOP, MFG_SPM,
++	MFG_INFRA, MFG_MM, MFG_FH, MFG_BANKS, MFG_PMIC };
++
++static const u64 mfg_region_start[MFG_BANKS] = {
++	0x13000000, 0x1000c000, 0x10000000, 0x10006000,
++	0x10001000, 0x14000000, 0x1000cf00
++};
++static const u32 mfg_region_size[MFG_BANKS] = {
++	0x200, 0x1000, 0x1000, 0x1000, 0x1000, 0x1000, 0x100
++};
++
++struct mfg_profile {
++	bool exact_machine;
++	bool exact_binding;
++	unsigned long ref_hz;
++	u64 start[MFG_BANKS];
++	u32 size[MFG_BANKS];
++};
++
++struct mfg_io {
++	void *ctx;
++	int (*read)(void *ctx, enum mfg_bank bank, u32 offset, u32 *value);
++	int (*write)(void *ctx, enum mfg_bank bank, u32 offset, u32 value);
++	void (*delay_us)(void *ctx, unsigned int us);
++	unsigned long (*lock_fh)(void *ctx);
++	void (*unlock_fh)(void *ctx, unsigned long flags);
++};
++
++/* Stage-3 failure only; values come from the existing predicate read. */
++struct mfg_admission_failure {
++	bool valid;
++	unsigned int pass; /* one-based admission pass */
++	enum mfg_bank bank;
++	u32 offset, value, mask, expected;
++	int read_error; /* value is unknown when nonzero */
++};
++
++struct mfg_sequence {
++	struct mfg_io io;
++	bool attempted;
++	bool mutated;
++	bool quarantined;
++	bool held;
++	unsigned int stage;
++	u32 fh_entry[3]; /* CLK/RST/HP before software establishment, not CFG. */
++	unsigned int admission_pass; /* nonzero only during stage-3 admission */
++	struct mfg_admission_failure admission_failure;
++};
++
++static inline int mfg_read(struct mfg_sequence *s, enum mfg_bank b,
++			   u32 o, u32 *v)
++{
++	return s->io.read(s->io.ctx, b, o, v);
++}
++
++static inline int mfg_write(struct mfg_sequence *s, enum mfg_bank b,
++			    u32 o, u32 v)
++{
++	/* Latch BEFORE submission: a transport failure may follow a real write. */
++	s->mutated = true;
++	return s->io.write(s->io.ctx, b, o, v);
++}
++
++static inline int mfg_check(struct mfg_sequence *s, enum mfg_bank b,
++			    u32 o, u32 mask, u32 expected, int ret, u32 v)
++{
++
++	if (s->stage == 3 && s->admission_pass &&
++	    !s->admission_failure.valid && (ret || (v & mask) != expected))
++		s->admission_failure = (struct mfg_admission_failure) {
++			.valid = true, .pass = s->admission_pass, .bank = b,
++			.offset = o, .value = ret ? 0 : v,
++			.mask = mask, .expected = expected, .read_error = ret,
++		};
++	return ret ? ret : ((v & mask) == expected ? 0 : -EINVAL);
++}
++
++static inline int mfg_expect(struct mfg_sequence *s, enum mfg_bank b,
++			     u32 o, u32 mask, u32 expected)
++{
++	u32 v;
++	int ret = mfg_read(s, b, o, &v);
++
++	return mfg_check(s, b, o, mask, expected, ret, ret ? 0 : v);
++}
++
++static inline int mfg_poll(struct mfg_sequence *s, enum mfg_bank b,
++			   u32 o, u32 mask, u32 expected)
++{
++	unsigned int i;
++	u32 v;
++	int ret;
++
++	for (i = 0; i < MFG_POLL_US; i++) {
++		ret = mfg_read(s, b, o, &v);
++		if (ret)
++			return ret;
++		if ((v & mask) == expected)
++			return 0;
++		s->io.delay_us(s->io.ctx, 1);
++	}
++	return -ETIMEDOUT;
++}
++
++static inline int mfg_update(struct mfg_sequence *s, enum mfg_bank b,
++			     u32 o, u32 mask, u32 value)
++{
++	u32 v;
++	int ret = mfg_read(s, b, o, &v);
++
++	if (ret)
++		return ret;
++	ret = mfg_write(s, b, o, (v & ~mask) | value);
++	return ret ? ret : mfg_poll(s, b, o, mask, value);
++}
++
++static inline int mfg_profile_check(const struct mfg_profile *p)
++{
++	unsigned int i;
++
++	if (!p->exact_machine || !p->exact_binding || p->ref_hz != MFG_REF_RATE)
++		return -EINVAL;
++	for (i = 0; i < MFG_BANKS; i++)
++		if (p->start[i] != mfg_region_start[i] ||
++		    p->size[i] != mfg_region_size[i])
++			return -EINVAL;
++	return 0;
++}
++
++/* Full words are recorded/compared; no interpretation of DA_STB or delay
++ * fields as a lock/busy protocol. PMIC transactions use the native serializer.
++ */
++static inline int mfg_rail(struct mfg_sequence *s)
++{
++	static const u32 regs[] = { 0x628, 0x62c, 0x630, 0x632, 0x638 };
++	u32 a[5], b[5];
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 5; i++) {
++		ret = mfg_read(s, MFG_PMIC, regs[i], &a[i]);
++		if (ret)
++			return ret;
++	}
++	for (i = 0; i < 5; i++) {
++		ret = mfg_read(s, MFG_PMIC, regs[i], &b[i]);
++		if (ret)
++			return ret;
++		if (a[i] != b[i])
++			return -EINVAL;
++	}
++	if ((a[0] & 3) || (a[1] & 0x2001) != 0x2001 ||
++	    (a[2] & 0x7f) != (a[3] & 0x7f) ||
++	    (a[2] & 0x7f) < 0x30 || (a[2] & 0x7f) > 0x40 ||
++	    (a[4] & 0xcd80))
++		return -EINVAL;
++	return 0;
++}
++
++static inline int mfg_fh(struct mfg_sequence *s)
++{
++	u32 clk, rst, hp, cfg, v;
++	int ret;
++
++	/* Strict running invariant: qualify gates before channel access. */
++	ret = mfg_read(s, MFG_FH, 4, &clk);
++	if (ret)
++		return ret;
++	ret = mfg_read(s, MFG_FH, 8, &rst);
++	if (ret)
++		return ret;
++	if (!(clk & MFG_BIT(4)) || !(rst & MFG_BIT(4)))
++		return -EINVAL;
++	ret = mfg_read(s, MFG_FH, 0, &hp);
++	if (ret)
++		return ret;
++	ret = mfg_read(s, MFG_FH, 0x88, &cfg);
++	if (ret)
++		return ret;
++	if ((hp & MFG_BIT(4)) || (cfg & 7))
++		return -EINVAL;
++	ret = mfg_read(s, MFG_FH, 4, &v);
++	if (ret || v != clk)
++		return ret ? ret : -EINVAL;
++	ret = mfg_read(s, MFG_FH, 8, &v);
++	if (ret || v != rst)
++		return ret ? ret : -EINVAL;
++	ret = mfg_read(s, MFG_FH, 0, &v);
++	if (ret || v != hp)
++		return ret ? ret : -EINVAL;
++	ret = mfg_read(s, MFG_FH, 0x88, &v);
++	return ret ? ret : (v == cfg ? 0 : -EINVAL);
++}
++
++/* Entry admits inaccessible CFG only with stable CLK4=RST4=HP4=0. */
++static inline int mfg_fh_entry(struct mfg_sequence *s, u32 globals[3])
++{
++	static const u32 offsets[] = { 4, 8, 0 };
++	u32 v;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 3; i++) {
++		ret = mfg_read(s, MFG_FH, offsets[i], &globals[i]);
++		if (ret)
++			return ret;
++	}
++	if (((globals[0] ^ globals[1]) & MFG_BIT(4)) ||
++	    (globals[2] & MFG_BIT(4)))
++		return -EINVAL;
++	for (i = 0; i < 3; i++) {
++		ret = mfg_read(s, MFG_FH, offsets[i], &v);
++		if (ret || v != globals[i])
++			return ret ? ret : -EINVAL;
++	}
++	return globals[0] & MFG_BIT(4) ? mfg_fh(s) : 0;
++}
++
++/* Exact-stock channel-4 iteration, once, after complete cold admission.
++ * The local IRQ-safe lock serializes this owner only: no firmware exclusion
++ * or hardware semaphore replacement. The exact native DT/source must have
++ * no competing FH writer at this synchronous pre-publication fs_initcall.
++ */
++static inline int mfg_fh_bootstrap(struct mfg_sequence *s)
++{
++	static const u32 globals[] = { 4, 8, 0 };
++	static const u32 offsets[] = { 4, 8, 8, 0x88, 0x8c, 0x90 };
++	u32 values[] = { s->fh_entry[0] | MFG_BIT(4),
++		s->fh_entry[1], s->fh_entry[1] | MFG_BIT(4), 0, 0, 0 };
++	unsigned long flags = s->io.lock_fh(s->io.ctx);
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 3; i++) {
++		ret = mfg_expect(s, MFG_FH, globals[i], ~0U, s->fh_entry[i]);
++		if (ret)
++			goto out;
++	}
++	for (i = 0; i < 6; i++) {
++		if (i < 3) {
++			ret = mfg_expect(s, MFG_FH, offsets[i], ~0U,
++				i == 2 ? values[1] : s->fh_entry[i]);
++			if (ret)
++				goto out;
++		}
++		if (i == 3) {
++			ret = mfg_expect(s, MFG_FH, 4, ~0U, values[0]);
++			if (ret)
++				goto out;
++			ret = mfg_expect(s, MFG_FH, 8, ~0U, values[2]);
++			if (ret)
++				goto out;
++		}
++		ret = mfg_write(s, MFG_FH, offsets[i], values[i]);
++		if (ret)
++			goto out;
++		ret = mfg_expect(s, MFG_FH, offsets[i], ~0U, values[i]);
++		if (ret)
++			goto out;
++		ret = mfg_expect(s, MFG_FH, 0, ~0U, s->fh_entry[2]);
++		if (ret)
++			goto out;
++	}
++	ret = mfg_expect(s, MFG_FH, 4, ~0U, values[0]);
++	if (ret)
++		goto out;
++	ret = mfg_expect(s, MFG_FH, 8, ~0U, values[2]);
++	if (ret)
++		goto out;
++	ret = mfg_fh(s);
++out:
++	s->io.unlock_fh(s->io.ctx, flags);
++	return ret;
++}
++
++static inline int mfg_display(struct mfg_sequence *s)
++{
++	int ret;
++
++	ret = mfg_expect(s, MFG_SPM, 0x180, MFG_BIT(3), MFG_BIT(3));
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x184, MFG_BIT(3), MFG_BIT(3));
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x30c,
++		MFG_CTL_MASK | MFG_BIT(8) | MFG_BIT(12), MFG_CTL_ON);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_INFRA, 0x220, MFG_BIT(1), 0);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_INFRA, 0x228, MFG_BIT(1), 0);
++	if (ret)
++		return ret;
++	/* Only after the powered, unprotected display aperture is qualified. */
++	return mfg_expect(s, MFG_MM, 0x100, MFG_BIT(0), 0);
++}
++
++/* Entry only: either consistent protected-off or cold/unprotected. Never
++ * use this relaxed protection predicate from running/consumer callbacks.
++ */
++static inline int mfg_islands_off(struct mfg_sequence *s, u32 protection[2])
++{
++	int ret;
++
++	ret = mfg_expect(s, MFG_SPM, 0x180, MFG_GPU_STATUS, 0);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x184, MFG_GPU_STATUS, 0);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x334, MFG_CTL_MASK, MFG_CTL_OFF);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x338,
++		MFG_CTL_MASK | MFG_BIT(8) | MFG_BIT(16),
++		MFG_CTL_OFF | MFG_BIT(8) | MFG_BIT(16));
++	if (ret)
++		return ret;
++	ret = mfg_read(s, MFG_INFRA, 0x220, &protection[0]);
++	if (ret)
++		return mfg_check(s, MFG_INFRA, 0x220, MFG_PROTECT,
++				 MFG_PROTECT, ret, 0);
++	ret = mfg_read(s, MFG_INFRA, 0x228, &protection[1]);
++	return mfg_check(s, MFG_INFRA, 0x228, MFG_PROTECT,
++			 protection[0] & MFG_PROTECT, ret, ret ? 0 : protection[1]);
++}
++
++/* Exact-board synchronous pre-publication phase ONLY: the native source/DT
++ * excludes active INFRA RMW peers here; this is not firmware arbitration.
++ * Native infracfg documents protection for disabled domains. Exact stock
++ * supplies bit21 RMW + barrier + ACK. A cold ACK is attempted, not assumed.
++ */
++static inline int mfg_protection_establish(struct mfg_sequence *s,
++					  const u32 entry[2])
++{
++	u32 enabled = entry[0] | MFG_PROTECT;
++	int ret;
++
++	ret = mfg_expect(s, MFG_INFRA, 0x220, ~0U, entry[0]);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_INFRA, 0x228, ~0U, entry[1]);
++	if (ret)
++		return ret;
++	/* Fail closed BEFORE submission, even if a failed write took effect. */
++	s->quarantined = true;
++	ret = mfg_write(s, MFG_INFRA, 0x220, enabled);
++	if (ret)
++		return ret;
++	ret = mfg_poll(s, MFG_INFRA, 0x220, ~0U, enabled);
++	if (ret)
++		return ret;
++	ret = mfg_poll(s, MFG_INFRA, 0x228, MFG_PROTECT, MFG_PROTECT);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_INFRA, 0x220, ~0U, enabled);
++	if (ret)
++		return ret;
++	return mfg_expect(s, MFG_INFRA, 0x228, ~0U, entry[1] | MFG_PROTECT);
++}
++
++static inline int mfg_pll_state(struct mfg_sequence *s, bool *on, u32 *word)
++{
++	u32 con0, con1, pwr;
++	int ret;
++
++	ret = mfg_read(s, MFG_APMIXED, 0x240, &con0);
++	if (ret)
++		return ret;
++	ret = mfg_read(s, MFG_APMIXED, 0x244, &con1);
++	if (ret)
++		return ret;
++	ret = mfg_read(s, MFG_APMIXED, 0x24c, &pwr);
++	if (ret)
++		return ret;
++	*word = con1 & (MFG_DIV_MASK | MFG_PCW_MASK);
++	*on = !!(con0 & 1);
++	if (!*on)
++		return (pwr & 3) == 2 ? 0 : -EINVAL;
++	if ((pwr & 3) != 1 || (con1 & MFG_DIV_MASK) != MFG_DIV2 ||
++	    ((con1 & MFG_PCW_MASK) != MFG_PCW351 &&
++	     (con1 & MFG_PCW_MASK) != MFG_PCW520))
++		return -EINVAL;
++	return 0;
++}
++
++static inline int mfg_pll351(struct mfg_sequence *s)
++{
++	int ret = mfg_expect(s, MFG_APMIXED, 0x240, 1, 1);
++
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_APMIXED, 0x24c, 3, 1);
++	if (ret)
++		return ret;
++	return mfg_expect(s, MFG_APMIXED, 0x244,
++		MFG_PCW_MASK | MFG_DIV_MASK, MFG_PCW351 | MFG_DIV2);
++}
++
++static inline int mfg_island_on(struct mfg_sequence *s, u32 reg, u32 bit)
++{
++	int ret;
++
++	ret = mfg_write(s, MFG_SPM, 0, 0x0b160001);
++	if (ret)
++		return ret;
++	ret = mfg_update(s, MFG_SPM, reg, MFG_BIT(2), MFG_BIT(2));
++	if (ret)
++		return ret;
++	ret = mfg_update(s, MFG_SPM, reg, MFG_BIT(3), MFG_BIT(3));
++	if (ret)
++		return ret;
++	ret = mfg_poll(s, MFG_SPM, 0x180, bit, bit);
++	if (ret)
++		return ret;
++	ret = mfg_poll(s, MFG_SPM, 0x184, bit, bit);
++	if (ret)
++		return ret;
++	ret = mfg_update(s, MFG_SPM, reg, MFG_BIT(4), 0);
++	if (ret)
++		return ret;
++	ret = mfg_update(s, MFG_SPM, reg, MFG_BIT(1), 0);
++	if (ret)
++		return ret;
++	return mfg_update(s, MFG_SPM, reg, MFG_BIT(0), MFG_BIT(0));
++}
++
++static inline int mfg_running(struct mfg_sequence *s)
++{
++	int ret;
++
++	ret = mfg_rail(s);
++	if (ret)
++		return ret;
++	ret = mfg_fh(s);
++	if (ret)
++		return ret;
++	ret = mfg_display(s);
++	if (ret)
++		return ret;
++	ret = mfg_pll351(s);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_TOP, 0x50, 0x83000000, 0x01000000);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x180, MFG_GPU_STATUS, MFG_GPU_STATUS);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x184, MFG_GPU_STATUS, MFG_GPU_STATUS);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x334, MFG_CTL_MASK, MFG_CTL_ON);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_SPM, 0x338,
++		MFG_CTL_MASK | MFG_BIT(8) | MFG_BIT(16), MFG_CTL_ON);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_INFRA, 0x220, MFG_PROTECT, 0);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_INFRA, 0x228, MFG_PROTECT, 0);
++	if (ret)
++		return ret;
++	ret = mfg_expect(s, MFG_MFG, 0, 1, 0);
++	if (ret)
++		return ret;
++	return mfg_expect(s, MFG_MFG, 0x1c, 0xffffffff, 7);
++}
++
++static inline int mfg_run(struct mfg_sequence *s, const struct mfg_profile *p)
++{
++	bool on = false, on2 = false;
++	u32 top, previous_top = 0, word, previous_word = 0, fh[3];
++	u32 protection[2], previous_protection[2] = {};
++	int ret;
++	unsigned int pass;
++
++	/* A rejected repeat must not expose a previous invocation's snapshot. */
++	s->admission_failure.valid = false;
++	s->admission_pass = 0;
++	if (s->attempted)
++		return -EALREADY;
++	s->attempted = true;
++	ret = mfg_profile_check(p);
++	if (ret)
++		return ret;
++	/* Repeat full admission; never inspect the OFF MFG aperture. */
++	for (pass = 0; pass < 2; pass++) {
++		s->stage = 1;
++		ret = mfg_rail(s);
++		if (ret)
++			return ret;
++		s->stage = 2;
++		ret = mfg_fh_entry(s, fh);
++		if (ret)
++			return ret;
++		if (pass && (fh[0] != s->fh_entry[0] ||
++		    fh[1] != s->fh_entry[1] || fh[2] != s->fh_entry[2]))
++			return -EINVAL;
++		s->fh_entry[0] = fh[0];
++		s->fh_entry[1] = fh[1];
++		s->fh_entry[2] = fh[2];
++		s->admission_pass = pass + 1;
++		s->stage = 3;
++		ret = mfg_islands_off(s, protection);
++		if (ret)
++			return ret;
++		if (pass && (protection[0] != previous_protection[0] ||
++		    protection[1] != previous_protection[1]))
++			return -EINVAL;
++		previous_protection[0] = protection[0];
++		previous_protection[1] = protection[1];
++		ret = mfg_display(s);
++		if (ret)
++			return ret;
++		s->admission_pass = 0;
++		s->stage = 4;
++		ret = mfg_pll_state(s, &on2, &word);
++		if (ret)
++			return ret;
++		if (pass && (on != on2 || previous_word != word))
++			return -EINVAL;
++		on = on2;
++		previous_word = word;
++		ret = mfg_read(s, MFG_TOP, 0x50, &top);
++		if (ret)
++			return ret;
++		/* Only actual reference/MMPLL parents are admitted, not aliases
++		 * for the two foreign hardware mux encodings.
++		 */
++		if (((top >> 24) & 3) > 1)
++			return -EINVAL;
++		if (pass && ((top ^ previous_top) & 0x83000000))
++			return -EINVAL;
++		previous_top = top;
++	}
++
++#define MFG_DO(expr) do { ret = (expr); if (ret) goto fail; } while (0)
++	if (!(s->fh_entry[0] & MFG_BIT(4))) {
++		s->stage = 14;
++		MFG_DO(mfg_fh_bootstrap(s));
++	}
++	if (!(protection[0] & MFG_PROTECT)) {
++		s->stage = 15;
++		MFG_DO(mfg_protection_establish(s, protection));
++	}
++	s->stage = 5;
++	if (on) {
++		MFG_DO(mfg_update(s, MFG_APMIXED, 0x240, 1, 0));
++		MFG_DO(mfg_update(s, MFG_APMIXED, 0x24c, 2, 2));
++		MFG_DO(mfg_update(s, MFG_APMIXED, 0x24c, 1, 0));
++	}
++	MFG_DO(mfg_expect(s, MFG_APMIXED, 0x240, 1, 0));
++	MFG_DO(mfg_expect(s, MFG_APMIXED, 0x24c, 3, 2));
++	s->stage = 6;
++	/* Disabled PLL: preserve bit31 and unrelated CON1 bits. No invented
++	 * strobe, busy, or lock bit; exact stock off-rate helper semantics.
++	 */
++	MFG_DO(mfg_update(s, MFG_APMIXED, 0x244,
++		MFG_PCW_MASK | MFG_DIV_MASK, MFG_PCW351 | MFG_DIV2));
++	MFG_DO(mfg_update(s, MFG_APMIXED, 0x24c, 1, 1));
++	s->io.delay_us(s->io.ctx, 1);
++	MFG_DO(mfg_update(s, MFG_APMIXED, 0x24c, 2, 0));
++	s->io.delay_us(s->io.ctx, 1);
++	MFG_DO(mfg_update(s, MFG_APMIXED, 0x240, 1, 1));
++	s->io.delay_us(s->io.ctx, 20);
++	MFG_DO(mfg_pll351(s));
++	s->stage = 7;
++	MFG_DO(mfg_write(s, MFG_TOP, 0x58, 0x83000000));
++	MFG_DO(mfg_write(s, MFG_TOP, 0x54, 0x01000000));
++	MFG_DO(mfg_write(s, MFG_TOP, 4, MFG_BIT(7)));
++	MFG_DO(mfg_poll(s, MFG_TOP, 0x50, 0x83000000, 0x01000000));
++	s->stage = 8;
++	MFG_DO(mfg_island_on(s, 0x334, MFG_BIT(23)));
++	s->stage = 9;
++	MFG_DO(mfg_island_on(s, 0x338, MFG_BIT(4)));
++	s->stage = 10;
++	MFG_DO(mfg_update(s, MFG_SPM, 0x338, MFG_BIT(8), 0));
++	MFG_DO(mfg_poll(s, MFG_SPM, 0x338, MFG_BIT(16), 0));
++	s->stage = 11;
++	MFG_DO(mfg_update(s, MFG_INFRA, 0x220, MFG_PROTECT, 0));
++	MFG_DO(mfg_poll(s, MFG_INFRA, 0x228, MFG_PROTECT, 0));
++	s->stage = 12;
++	MFG_DO(mfg_write(s, MFG_MFG, 8, 1));
++	MFG_DO(mfg_poll(s, MFG_MFG, 0, 1, 0));
++	MFG_DO(mfg_write(s, MFG_MFG, 0x1c, 7));
++	s->stage = 13;
++	MFG_DO(mfg_running(s));
++	s->held = true;
++	s->quarantined = false; /* Clear provisional quarantine only on full success. */
++	return 0;
++fail:
++	/* Never power off, assert protection, disable a clock, or retry. */
++	s->quarantined = s->mutated;
++	return ret;
++#undef MFG_DO
++}
++
++#endif /* __CLK_MT6750_MFG_SEQUENCE_H */
+diff --git a/include/video/fb_handover.h b/include/video/fb_handover.h
+new file mode 100644
+--- /dev/null
++++ b/include/video/fb_handover.h
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef _VIDEO_FB_HANDOVER_H
++#define _VIDEO_FB_HANDOVER_H
++
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/kstrtox.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
++
++/* Software file-lifetime gate, not a hardware-resource or power interlock. */
++struct fb_handover_gate {
++	struct mutex lock;
++	unsigned int users;
++	bool blocked;
++};
++
++#define DEFINE_FB_HANDOVER_GATE(name) \
++	static struct fb_handover_gate name = { \
++		.lock = __MUTEX_INITIALIZER(name.lock), \
++	}
++
++static inline int fb_handover_open(struct fb_handover_gate *gate)
++{
++	int ret = 0;
++
++	mutex_lock(&gate->lock);
++	if (gate->blocked)
++		ret = -EBUSY;
++	else
++		gate->users++;
++	mutex_unlock(&gate->lock);
++	return ret;
++}
++
++static inline void fb_handover_close(struct fb_handover_gate *gate)
++{
++	mutex_lock(&gate->lock);
++	if (!WARN_ON(!gate->users))
++		gate->users--;
++	mutex_unlock(&gate->lock);
++}
++
++static int fb_handover_set(const char *text, const struct kernel_param *parameter)
++{
++	struct fb_handover_gate *gate = parameter->arg;
++	bool blocked;
++	int ret = kstrtobool(text, &blocked);
++
++	if (ret)
++		return ret;
++	mutex_lock(&gate->lock);
++	if (blocked && gate->users)
++		ret = -EBUSY;
++	else
++		gate->blocked = blocked;
++	mutex_unlock(&gate->lock);
++	return ret;
++}
++
++static int fb_handover_get(char *buffer, const struct kernel_param *parameter)
++{
++	struct fb_handover_gate *gate = parameter->arg;
++	struct kernel_param value = *parameter;
++	int ret;
++
++	value.arg = &gate->blocked;
++	mutex_lock(&gate->lock);
++	ret = param_get_bool(buffer, &value);
++	mutex_unlock(&gate->lock);
++	return ret;
++}
++
++static const struct kernel_param_ops fb_handover_ops = {
++	.set = fb_handover_set,
++	.get = fb_handover_get,
++};
++#endif
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -15,7 +15,7 @@
+  *  - /sys/kernel/mt6755_pmic/{battery_mv,charge_ma,charging,state}: AUXADC
+  *    readout (BATSNS/ISENSE, 56 mOhm sense resistor).
+  *  - charge control (sampled every 2 s): battery NTC on AUXADC ch3 (BATON,
+- *    16.9k pull-up to 1.8 V, 10k NTC, stock table), charging only inside
++ *    24k pull-up to 1.8 V, 10k NTC, stock table), charging only inside
+  *    0..45 C (resume 3..42 C), stop when full (>= 4.15 V and battery current
+  *    < 60 mA for 60 s, recharge below 4.05 V), software VBAT cap 4.25 V, NTC open/
+  *    short = no charging. Orderly power-off below 3.45 V when not charging.
+@@ -47,6 +47,7 @@
+ #include <linux/input.h>
+ #include <linux/io.h>
+ #include <linux/kobject.h>
++#include <linux/ktime.h>
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+@@ -271,31 +272,108 @@
+ 	return ret;
+ }
+ 
+-/* BATON (NTC) voltage in mV, 12-bit channel */
++/* Observe request start as well as completion: queued conversions retain old RDY data. */
++static int auxadc_complete(unsigned int channel, u16 reg)
++{
++	bool started = false;
++	u16 value, busy;
++	int ret;
++
++	ret = mt6755_pmic_write(AUXADC_RQST0_SET, BIT(channel));
++	for (int i = 0; !ret && i < 700; i++) {
++		ret = mt6755_pmic_read(reg, &value);
++		if (!ret)
++			ret = mt6755_pmic_read(0x0E92, &busy);
++		if (ret)
++			break;
++		started |= !(value & BIT(15)) || (busy & BIT(channel));
++		if (started && (value & BIT(15)) && !(busy & BIT(channel)))
++			return 0;
++		udelay(5);
++	}
++	return ret ?: -ETIMEDOUT;
++}
++
++/* Reject concurrent MDRT activity, not a voltage band: genuine hot/cold remain admissible. */
++static int baton_sample(int *mv)
++{
++	u64 start, last, now;
++	u16 before, after, status, value, busy;
++	bool started = false;
++	int ret;
++
++	ret = auxadc_complete(0, AUXADC_ADC23);
++	if (!ret)
++		ret = auxadc_complete(1, AUXADC_ADC25);
++	if (!ret)
++		ret = mt6755_pmic_read(0x0E40, &before);
++	if (!ret)
++		ret = mt6755_pmic_read(0x0E94, &status);
++	if (ret)
++		return ret;
++	if (!(before & BIT(15)) || (status & BIT(5)))
++		return -EAGAIN;
++	start = last = ktime_get_ns();
++	ret = mt6755_pmic_write(AUXADC_RQST0_SET, BIT(3));
++	for (int i = 0; !ret && i < 100; i++) {
++		now = ktime_get_ns();
++		if (now - last > 32000 || now - start > 500000)
++			return -EAGAIN;
++		last = now;
++		ret = mt6755_pmic_read(0x0E94, &status);
++		if (!ret)
++			ret = mt6755_pmic_read(AUXADC_ADC3, &value);
++		if (!ret)
++			ret = mt6755_pmic_read(0x0E92, &busy);
++		if (ret)
++			break;
++		if (status & BIT(5))
++			return -EAGAIN;
++		started |= !(value & BIT(15)) || (busy & BIT(3));
++		if (started && (value & BIT(15)) && !(busy & BIT(3))) {
++			ret = mt6755_pmic_read(0x0E40, &after);
++			if (!ret)
++				ret = mt6755_pmic_read(0x0E94, &status);
++			now = ktime_get_ns();
++			if (ret)
++				break;
++			if (now - last > 32000 || now - start > 500000 ||
++			    before != after || (status & BIT(5)))
++				return -EAGAIN;
++			*mv = (value & 0xfff) * 1800 / 4096;
++			return 0;
++		}
++		udelay(1);
++	}
++	return ret ?: -EAGAIN;
++}
++
++/* Two agreeing, provenance-checked acquisitions; no cached temperature advances a latch. */
+ static int baton_read(int *mv)
+ {
+-	int ret = -ETIMEDOUT;
+-	u16 v;
++	int ret, value, previous = -1;
+ 
+ 	mutex_lock(&adc_lock);
+-	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
+-	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
+-	mt6755_pmic_write(AUXADC_RQST0_SET, BIT(3));
+-	usleep_range(1000, 1500);
+-	for (int i = 0; i < 100; i++) {
+-		if (mt6755_pmic_read(AUXADC_ADC3, &v)) {
+-			ret = -EIO;
++	ret = mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
++	if (!ret)
++		ret = mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
++	for (int i = 0; !ret && i < 8; i++) {
++		ret = baton_sample(&value);
++		if (ret == -EAGAIN) {
++			ret = 0;
++			continue;
++		}
++		if (ret)
+ 			break;
++		if (previous >= 0 && abs(value - previous) <= 10) {
++			*mv = value;
++			mutex_unlock(&adc_lock);
++			return 0;
+ 		}
+-		if (v & 0x8000) {
+-			*mv = (int)(v & 0xfff) * 1800 / 4096;
+-			ret = 0;
+-			break;
+-		}
+-		usleep_range(100, 200);
++		previous = value;
+ 	}
+ 	mutex_unlock(&adc_lock);
+-	return ret;
++	return ret ?: -EAGAIN;
+ }
+ 
+ static ssize_t battery_mv_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+@@ -334,7 +412,7 @@
+ static const struct attribute_group pmic_group = { .attrs = pmic_attrs };
+ 
+ /* ---------------- charge control ---------------- */
+-#define RBAT_PULL_UP_R		16900	/* ohm, to 1.8 V (stock MT6353 value) */
++#define RBAT_PULL_UP_R		24000	/* ohm, to 1.8 V (stock MT6353 value) */
+ #define RBAT_PULL_UP_MV		1800
+ 
+ /* stock 10k NTC table: {deg C, ohm} */
+@@ -393,8 +471,8 @@
+ 
+ /*
+  * Charging decisions use the last good sample of each input; one that is too old (conversions
+- * failing) stops charging (CHG_ADC) instead of trusting it. The NTC limit covers the 30 s a real
+- * temperature step needs to pass the BATON plausibility filter.
++ * failing) stops charging (CHG_ADC) instead of trusting it. Rejected/failed acquisitions do not refresh the
++ * input timestamp or advance the hot/cold latches.
+  */
+ #define VBAT_MAX_AGE	(10 * HZ)
+ #define NTC_MAX_AGE	(60 * HZ)
+@@ -409,7 +487,6 @@
+ 	int full_cnt, low_cnt, start_wait, lim_cnt, hot_cnt, cold_cnt;
+ 	bool limited;			/* charge limit reached; survives hot/cold/unplug interruptions */
+ 	bool vntc_valid;
+-	int ntc_jump;			/* consecutive BATON samples far from the accepted value */
+ 	bool vbat_valid, fg_valid;
+ 	unsigned long vbat_at, ntc_at, fg_at;	/* jiffies of the last good vbat / NTC / gauge sample */
+ } bs;
+@@ -591,7 +668,7 @@
+ {
+ 	enum chg_state st = bs.st, old = bs.st;
+ 	int vbat, ibat, vntc, t, vocv, oldcap = bs.cap;
+-	bool chr, oldchr = bs.chr, vbat_ok, ntc_fresh;
++	bool chr, oldchr = bs.chr, vbat_ok, ntc_fresh, ntc_new = false;
+ 	u16 c0;
+ 
+ 	if (mt6755_pmic_read(CHR_CON0, &c0))
+@@ -603,22 +680,14 @@
+ 		bs.vbat_valid = true;
+ 		bs.vbat_at = jiffies;
+ 	}
+-	/*
+-	 * BATON plausibility: the GPS co-TSX (MDRT) conversion lands in the same output register
+-	 * about one sample in four (~1.15 V, reads as 0 C). A battery cannot change by > 60 mV
+-	 * (~3 C) in 2 s, so a far sample counts only once it persists for 15 samples (30 s; a
+-	 * real NTC open/short still gets through).
+-	 */
+ 	if (!baton_read(&vntc)) {
+-		if (!bs.vntc_valid || abs(vntc - bs.vntc) <= 60 || ++bs.ntc_jump >= 15) {
+-			bs.vntc = vntc;
+-			bs.vntc_valid = true;
+-			bs.ntc_jump = 0;
+-			bs.ntc_ok = !ntc_temp(vntc - bs.ibat * ntc_comp_mohm / 1000, &t);
+-			if (bs.ntc_ok)
+-				bs.temp = t;
+-			bs.ntc_at = jiffies;
+-		}
++		bs.vntc = vntc;
++		bs.vntc_valid = true;
++		bs.ntc_ok = !ntc_temp(vntc - bs.ibat * ntc_comp_mohm / 1000, &t);
++		if (bs.ntc_ok)
++			bs.temp = t;
++		bs.ntc_at = jiffies;
++		ntc_new = true;
+ 	}
+ 	vbat_ok = fresh(bs.vbat_valid, bs.vbat_at, VBAT_MAX_AGE);
+ 	ntc_fresh = fresh(bs.vntc_valid, bs.ntc_at, NTC_MAX_AGE);
+@@ -631,16 +700,18 @@
+ 	 * Two consecutive samples (4 s) to declare hot/cold: the BATON reading glitches for one
+ 	 * sample (~1.11 V = 0 C) right after CHR_EN switches.
+ 	 */
+-	bs.hot_cnt = bs.temp > 450 ? bs.hot_cnt + 1 : 0;
+-	bs.cold_cnt = bs.temp < 0 ? bs.cold_cnt + 1 : 0;
+-	if (bs.hot_cnt >= 2)
+-		bs.hot = true;
+-	else if (bs.temp <= 420)
+-		bs.hot = false;
+-	if (bs.cold_cnt >= 2)
+-		bs.cold = true;
+-	else if (bs.temp >= 30)
+-		bs.cold = false;
++	if (ntc_new && bs.ntc_ok) {
++		bs.hot_cnt = bs.temp > 450 ? bs.hot_cnt + 1 : 0;
++		bs.cold_cnt = bs.temp < 0 ? bs.cold_cnt + 1 : 0;
++		if (bs.hot_cnt >= 2)
++			bs.hot = true;
++		else if (bs.temp <= 420)
++			bs.hot = false;
++		if (bs.cold_cnt >= 2)
++			bs.cold = true;
++		else if (bs.temp >= 30)
++			bs.cold = false;
++	}
+ 	if (bs.vbat > 4250)
+ 		bs.ov = true;
+ 	else if (bs.vbat < 4150)
+@@ -741,9 +812,9 @@
+ 	}
+ 
+ 	if (st != old)
+-		pr_info("mt6755-pmic: %s -> %s (%d mV, %d mA, %d.%d C, ntc %d mV)\n",
++		pr_info("mt6755-pmic: %s -> %s (%d mV, %d mA, %s%d.%d C, ntc %d mV)\n",
+ 			chg_names[old], chg_names[st], bs.vbat, bs.fg_ma,
+-			bs.temp / 10, abs(bs.temp % 10), bs.vntc);
++			bs.temp < 0 ? "-" : "", abs(bs.temp / 10), abs(bs.temp % 10), bs.vntc);
+ 	if (bat_psy && (st != old || bs.cap != oldcap))
+ 		power_supply_changed(bat_psy);
+ 	if (usb_psy && chr != oldchr)
+@@ -914,6 +985,8 @@
+  * the firmware download (no 0xFE42 from mnld's point of view).
+  */
+ static const struct { u16 adr, mask; u8 shift; u16 val; } auxadc_init_tbl[] = {
++	{ 0x0EAC, 3, 0, 3 },		/* stock AP BATSNS/ISENSE averaging; preserve GPS */
++	{ 0x0EBC, 1, 9, 1 },		/* stock AUXADC reference buffer */
+ 	{ 0x0EB4, 0xfff, 4, 0x955 },	/* AUXADC_TRIM_CH2..7_SEL = 1,1,1,1,1,2 */
+ 	{ 0x0EB6, 0xff, 0, 0x55 },	/* AUXADC_TRIM_CH8..11_SEL = 1 */
+ 	{ 0x0EC8, 1, 14, 1 },		/* AUXADC_START_SHADE_EN */
+diff --git a/Kconfig b/Kconfig
+--- a/Kconfig
++++ b/Kconfig
+@@ -32,3 +32,9 @@
+ source "Documentation/Kconfig"
+ 
+ source "io_uring/Kconfig"
++
++config MT6750_STANDARD_INTERFACES
++	tristate
++	default m
++	select VIDEOBUF2_VMALLOC
++	select VIDEOBUF2_V4L2

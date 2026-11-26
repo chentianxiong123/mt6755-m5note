@@ -13,100 +13,78 @@ jobs:
       - name: Install cross toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison libssl-dev bc kmod cpio
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison libssl-dev bc kmod cpio libelf-dev rsync
 
-      - name: Cache kernel tarball
+      - name: Cache kernel tarball (7.3.1)
         id: cache-kernel
         uses: actions/cache@v4
         with:
-          path: linux-6.12.115.tar.gz
-          key: kernel-tarball-6.12.115
+          path: linux-7.3.1.tar.gz
+          key: kernel-tarball-7.3.1
 
-      - name: Download kernel 6.12.115
+      - name: Download kernel 7.3.1
         if: steps.cache-kernel.outputs.cache-hit != 'true'
-        run: wget -q https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/linux-6.12.115.tar.gz
+        run: wget -q https://mirrors.tuna.tsinghua.edu.cn/kernel/v7.x/linux-7.3.1.tar.gz
 
-      - name: Restore build tree (incremental .o)
-        id: cache-build
-        uses: actions/cache@v4
-        with:
-          path: build-tree.tar
-          key: buildtree-${{ hashFiles('mainline/config/m5note-server.config', 'mainline/dts/mt6755-m5note.dts', 'mainline/patches/**') }}
-          restore-keys: buildtree-
-
-      - name: Extract kernel
+      - name: Extract + rename to linux/
         run: |
-          if [ -f build-tree.tar ]; then
-            tar xf build-tree.tar
-            echo "=== 增量：恢复上次编译树 ==="
-          else
-            tar xf linux-6.12.115.tar.gz
-            echo "=== 首次：全新编译树 ==="
-          fi
-          echo "KERNEL_VERSION=$(make -C linux-6.12.115 -s kernelversion)" >> "$GITHUB_ENV"
+          tar xf linux-7.3.1.tar.gz
+          mv linux-7.3.1 linux
+          echo "KERNEL_VERSION=$(make -C linux -s kernelversion)" >> "$GITHUB_ENV"
 
-      - name: Install board dts
+      - name: Apply 33 MT6755 patches
         run: |
-          K=linux-6.12.115
-          cp mainline/dts/mt6755-m5note.dts $K/arch/arm64/boot/dts/mediatek/
-          MK=$K/arch/arm64/boot/dts/mediatek/Makefile
-          grep -q "mt6755-m5note.dtb" "$MK" || \
-            sed -i "/mt6755-evb.dtb/a dtb-\$(CONFIG_ARCH_MEDIATEK) += mt6755-m5note.dtb" "$MK"
-          echo 'DTC_FLAGS_mt6755-m5note := -@' >> "$MK"
+          cd linux
+          git init -q
+          git add -A && git -c user.email=ci@local -c user.name=ci commit -qm base
+          git am --whitespace=nowarn ../mainline/7.3.1/patches/linux/*.patch
+          echo "=== patches applied: $(git log --oneline | wc -l) ==="
 
-      - name: Install driver patches
+      - name: Prepare build tree
         run: |
-          K=linux-6.12.115
-          cp mainline/patches/pinctrl-mt6755.c \
-             mainline/patches/pinctrl-mtk-mt6755.h $K/drivers/pinctrl/mediatek/
-          cp mainline/patches/i2c-mt65xx.c $K/drivers/i2c/busses/
-          cp mainline/patches/phy-mtk-tphy.c $K/drivers/phy/mediatek/
+          # build.sh expects $TOP/linux and $TOP/out; stage build.sh next to linux/
+          cp mainline/7.3.1/build.sh .
+          cp mainline/7.3.1/config/kernel-7.3.1.config /tmp/reference.config
+          sed -i 's|^SRC=$TOP/linux OUT=$TOP/out|SRC=$TOP/linux OUT=$TOP/out|' build.sh
+          chmod +x build.sh
 
-      - name: Configure (full server)
+      - name: Configure (pminervini fragments)
         run: |
-          K=linux-6.12.115
-          cp mainline/config/m5note-server.config $K/.config
-          make -C $K ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          ./build.sh config
+          echo "=== config generated ==="
+          grep -E "^CONFIG_(CGROUPS|NETFILTER|OVERLAY_FS|CFG80211|USB_MTU3|MMC_MTK)=" out/.config | head
 
       - name: Build kernel
         run: |
-          K=linux-6.12.115
-          make -C $K ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            -j2 Image.gz dtbs modules
-          echo "=== 内核编译完成，Module.symvers 已生成 ==="
-          ls -lh $K/Module.symvers
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          ./build.sh
+          echo "=== Image.gz-dtb ==="; ls -lh out/Image.gz-dtb
 
-      - name: Pack build tree for next run
-        run: tar cf build-tree.tar linux-6.12.115
-
-      - name: Build CONSYS WiFi modules (out-of-tree)
+      - name: Build modules
         run: |
-          K=$PWD/linux-6.12.115
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make -C linux O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            modules INSTALL_MOD_PATH=$PWD/out/modules INSTALL_MOD_STRIP=1 modules_install >/dev/null 2>&1
+          echo "=== modules ==="; ls out/modules/lib/modules/ | head
+
+      - name: Build CONSYS WiFi modules (out-of-tree, 7.3.1 native)
+        run: |
           cd mainline/wifi
-          # 6.12 兼容补丁：sizeof(flexible array sa_data)
-          patch -p1 < ../patches/wifi/fix-sockaddr-sa_data.patch
-          make KDIR=$K ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONSYS_PLAT=mt6755
-          echo "=== CONSYS 模块 ==="
-          find . -name "*.ko" -exec ls -lh {} \;
+          make KDIR=$GITHUB_WORKSPACE/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONSYS_PLAT=mt6755
+          echo "=== CONSYS .ko ==="; find . -name "*.ko" -exec ls -lh {} \;
 
       - name: Collect artifacts
         run: |
-          mkdir -p out/modules
-          K=linux-6.12.115
-          cp $K/arch/arm64/boot/Image.gz out/
-          cp $K/arch/arm64/boot/dts/mediatek/mt6755-m5note.dtb out/
-          cp $K/.config out/config
-          # 内核内建模块（如果 =m 的）
-          find $K -name "*.ko" -exec cp {} out/modules/ \; 2>/dev/null || true
-          # CONSYS WiFi/BT 模块
-          find mainline/wifi -name "*.ko" -exec cp {} out/modules/ \; 2>/dev/null || true
-          echo "=== 产物 ==="
-          ls -lh out/
-          echo "=== 模块数 ==="
-          ls out/modules/ | wc -l
+          mkdir -p out_artifact/modules
+          cp out/Image.gz-dtb out_artifact/
+          cp out/.config out_artifact/config
+          find out/modules -name "*.ko" -exec cp {} out_artifact/modules/ \; 2>/dev/null || true
+          find mainline/wifi -name "*.ko" -exec cp {} out_artifact/modules/ \; 2>/dev/null || true
+          echo "=== artifact ==="; ls -lh out_artifact/; echo "模块数: $(ls out_artifact/modules/ | wc -l)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kernel-mt6755-m5note
-          path: out/*
+          name: kernel-mt6755-m5note-7.3.1
+          path: out_artifact/*
           retention-days: 30
