@@ -176,6 +176,20 @@
 	};
 };
 
+/* BQ25890 external charger on I2C1 (0x11008000).
+ * Use the full path, NOT &i2c1: that label belongs to lk-overlay-sink's parking node.
+ * ti,battery-regulation-voltage is in uV (4.397 V measured on the stock battery). */
+&{/soc/i2c@11008000} {
+	bq25890@6b {
+		compatible = "ti,bq25890";
+		reg = <0x6b>;
+		ti,battery-regulation-voltage = <4400000>;
+		ti,charge-current = <1500000>;
+		ti,termination-current = <150000>;
+		status = "okay";
+	};
+};
+
 &{/timer} {
 	clock-frequency = <13000000>;
 };

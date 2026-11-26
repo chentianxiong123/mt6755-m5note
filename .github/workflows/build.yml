@@ -84,8 +84,11 @@ jobs:
           else
             ./build.sh config
           fi
+          # 外置充电 IC BQ25890（mainline 有原生驱动）
+          linux/scripts/config --file out/.config -e CHARGER_BQ25890
+          make -C linux O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig >/dev/null
           echo "=== config ==="
-          grep -E "^CONFIG_(CGROUPS|NETFILTER|OVERLAY_FS|CFG80211|USB_MTU3|MMC_MTK)=" out/.config | head
+          grep -E "^CONFIG_(CGROUPS|NETFILTER|OVERLAY_FS|CFG80211|USB_MTU3|MMC_MTK|CHARGER_BQ25890)=" out/.config | head
 
       - name: Build kernel (incremental)
         run: |
