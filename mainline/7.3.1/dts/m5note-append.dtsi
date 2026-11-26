@@ -1,0 +1,27 @@
+/* M5 Note hardware appended to the patched k50v1 dts.
+ * i2c1 (0x11008000) is NOT defined by pminervini's patches (only i2c0 is),
+ * so define it here using values read from the stock device tree, then hang
+ * the BQ25890 charger off it. i2c_src_clk/clk26m_ref come from patch 0003. */
+
+&{/} {
+	i2c1_m5note: i2c@11008000 {
+		compatible = "mediatek,mt6755-i2c";
+		reg = <0 0x11008000 0 0x1000>, <0 0x11000180 0 0x80>;
+		interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_LOW>;
+		clocks = <&i2c_src_clk>, <&clk26m_ref>;
+		clock-names = "main", "dma";
+		clock-div = <10>;
+		clock-frequency = <100000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		bq25890@6b {
+			compatible = "ti,bq25890";
+			reg = <0x6b>;
+			ti,battery-regulation-voltage = <4400000>;
+			ti,charge-current = <1500000>;
+			ti,termination-current = <150000>;
+			status = "okay";
+		};
+	};
+};
