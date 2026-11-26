@@ -49,8 +49,8 @@ jobs:
 
       - name: Apply 33 MT6755 patches (only on fresh tree)
         run: |
-          if [ -d linux/.git ] && git -C linux log --oneline | grep -q "PATCH 33/33"; then
-            echo "=== 增量：patches 已应用，跳过 ==="
+          if [ -f linux/drivers/tty/serial/earlycon-ram.c ]; then
+            echo "=== 增量：patches 已应用（标记文件存在），跳过 ==="
             exit 0
           fi
           git config --global user.email ci@local
