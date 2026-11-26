@@ -1,0 +1,35 @@
+#!/bin/busybox sh
+# M5 Note mainline initramfs init — 唯一目的：挂载 /data，switch_root 进现成的 Debian。
+# 所有 rootfs 内容都在 /data/debian（mmcblk0p31, ext4, 4.3G, Debian 13 trixie + systemd）。
+# 不用 busybox 之外任何东西：busybox 是静态的，直接放 ramdisk /bin/busybox。
+exec > /dev/kmsg 2>&1
+echo "=== M5 Note mainline init ==="
+echo "cmdline: $(cat /proc/cmdline)"
+
+/bin/busybox --install -s
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+
+# 等 eMMC 起来
+i=0
+while [ ! -b /dev/mmcblk0p31 ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+[ -b /dev/mmcblk0p31 ] || { echo "FATAL: mmcblk0p31 not found"; /bin/busybox sh; }
+
+# 挂载 /data（只读保护其他分区，/data 读写——Debian 在里面）
+mount -t ext4 -o rw /dev/block/mmcblk0p31 /data || { echo "FATAL: mount /data failed"; /bin/busybox sh; }
+echo "/data mounted"
+
+# 确认 Debian rootfs 在
+[ -x /data/debian/sbin/init ] || { echo "FATAL: /data/debian/sbin/init missing"; /bin/busybox sh; }
+echo "Debian rootfs found: $(cat /data/debian/etc/os-release | head -1)"
+
+# 把内核需要的运行时文件系统 bind 进 Debian（chroot 时 TWRP 就是这么做的）
+mkdir -p /data/debian/proc /data/debian/sys /data/debian/dev /data/debian/dev/pts
+mount --move /proc /data/debian/proc
+mount --move /sys  /data/debian/sys
+mount --move /dev  /data/debian/dev
+
+echo "switch_root -> /data/debian /sbin/init"
+exec /bin/busybox switch_root /data/debian /sbin/init
