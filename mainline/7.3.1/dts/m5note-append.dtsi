@@ -18,8 +18,10 @@
 		bq25890@6b {
 			compatible = "ti,bq25890";
 			reg = <0x6b>;
-			ti,battery-regulation-voltage = <4400000>;
-			ti,charge-current = <1500000>;
+			/* stock battery: high_battery_voltage_support=0, measured full ~4.373V => 4.35V */
+			ti,battery-regulation-voltage = <4350000>;
+			/* stock charging_full_current=0x64 (~1 A); conservative 1 A */
+			ti,charge-current = <1000000>;
 			ti,termination-current = <150000>;
 			status = "okay";
 		};
