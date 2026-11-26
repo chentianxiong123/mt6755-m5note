@@ -75,7 +75,7 @@ jobs:
           sed -i 's|MT6750 tablet k50v1|Meizu M5 Note|g' "$OUT"
           sed -i 's|mediatek,k50v1-tablet|meizu,m5note|g' "$OUT"
           sed -i 's|0x0 0x80000000>; /\* lk overwrites|0x0 0xb0000000>; /* lk overwrites|' "$OUT"
-          sed -i 's|stdout-path = &framebuffer0;|stdout-path = &uart0;|g' "$OUT"
+          sed -i 's|stdout-path = \&framebuffer0;|stdout-path = \&uart0;|g' "$OUT"
           # 追加 M5 Note 专有硬件（i2c1 + BQ25890）
           cat mainline/7.3.1/dts/m5note-append.dtsi >> "$OUT"
           grep -q "mt6755-m5note.dtb" linux/arch/arm64/boot/dts/mediatek/Makefile || {
