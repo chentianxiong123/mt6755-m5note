@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -26,37 +26,60 @@ jobs:
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: wget -q https://mirrors.tuna.tsinghua.edu.cn/kernel/v7.x/linux-7.3.1.tar.gz
 
-      - name: Extract + rename to linux/
+      - name: Restore incremental build tree (.o)
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: build-tree.tar
+          key: buildtree-7.3.1-${{ github.run_id }}
+          restore-keys: |
+            buildtree-7.3.1-
+
+      - name: Prepare kernel source
         run: |
-          tar xf linux-7.3.1.tar.gz
-          mv linux-7.3.1 linux
+          if [ -f build-tree.tar ]; then
+            echo "=== 增量：恢复上次编译树 ==="
+            tar xf build-tree.tar
+          else
+            echo "=== 首次：解压源码 ==="
+            tar xf linux-7.3.1.tar.gz
+            mv linux-7.3.1 linux
+          fi
           echo "KERNEL_VERSION=$(make -C linux -s kernelversion)" >> "$GITHUB_ENV"
 
-      - name: Apply 33 MT6755 patches
+      - name: Apply 33 MT6755 patches (only on fresh tree)
         run: |
+          if [ -d linux/.git ] && git -C linux log --oneline | grep -q "PATCH 33/33"; then
+            echo "=== 增量：patches 已应用，跳过 ==="
+            exit 0
+          fi
           git config --global user.email ci@local
           git config --global user.name ci
           cd linux
-          git init -q
-          git add -A && git commit -qm base
+          if [ ! -d .git ]; then
+            git init -q
+            git add -A && git commit -qm base
+          fi
           git am --whitespace=nowarn ../mainline/7.3.1/patches/linux/*.patch
           echo "=== patches applied: $(git log --oneline | wc -l) ==="
 
       - name: Prepare build tree
         run: |
-          # build.sh expects $TOP/linux and $TOP/out; stage build.sh next to linux/
           cp mainline/7.3.1/build.sh .
-          sed -i 's|^SRC=$TOP/linux OUT=$TOP/out|SRC=$TOP/linux OUT=$TOP/out|' build.sh
           chmod +x build.sh
 
-      - name: Configure (pminervini fragments)
+      - name: Configure (pminervini fragments, only if missing)
         run: |
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-          ./build.sh config
-          echo "=== config generated ==="
+          if [ -f out/.config ]; then
+            echo "=== 增量：config 已存在，跳过 ==="
+          else
+            ./build.sh config
+          fi
+          echo "=== config ==="
           grep -E "^CONFIG_(CGROUPS|NETFILTER|OVERLAY_FS|CFG80211|USB_MTU3|MMC_MTK)=" out/.config | head
 
-      - name: Build kernel
+      - name: Build kernel (incremental)
         run: |
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           ./build.sh
@@ -76,6 +99,12 @@ jobs:
           find out/modules -name "*.ko" -exec cp {} out_artifact/modules/ \; 2>/dev/null || true
           find mainline/wifi -name "*.ko" -exec cp {} out_artifact/modules/ \; 2>/dev/null || true
           echo "=== artifact ==="; ls -lh out_artifact/; echo "模块数: $(ls out_artifact/modules/ | wc -l)"
+
+      - name: Pack build tree for next run
+        run: |
+          echo "=== 打包编译树供下次增量 ==="
+          tar cf build-tree.tar linux out
+          ls -lh build-tree.tar
 
       - uses: actions/upload-artifact@v4
         with:
