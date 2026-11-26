@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Meizu M5 Note (MT6755 / Helio P10, board from stock DT), mainline bring-up.
+ *
+ * Based on pminervini's k50v1 tablet stage-0 dts, adapted to M5 Note:
+ *  - 2.8 GiB RAM (lk overwrites with real size)
+ *  - no framebuffer node (display not brought up; lk keeps the panel, we skip it)
+ *  - BQ25890 charger on i2c1 @ 0x6b (external charger, unlike the tablet's PMIC charging)
+ *  - USB is MTU3 SSUSB @ 0x11270000 (same IP as k50v1, see patch 0003)
+ *
+ * lk quirks (same as k50v1): it patches /memory, /chosen and applies the
+ * odmdtbo overlay; lk-overlay-sink keeps every target label so lk's ASSERT
+ * does not fire. __symbols__ is required (dtc -@).
+ */
+
+/dts-v1/;
+
+#include "mt6755.dtsi"
+
+/ {
+	model = "Meizu M5 Note (MT6755)";
+	compatible = "meizu,m5note", "mediatek,mt6755";
+
+	psci {
+		compatible = "arm,psci";
+		method = "smc";
+		cpu_suspend = <0x84000001>;
+		cpu_off = <0x84000002>;
+		cpu_on = <0x84000003>;
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen: chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		bootargs = "";
+		stdout-path = &uart0;
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		/* 2.8 GiB usable (lk overwrites with the real size) */
+		reg = <0x0 0x40000000 0x0 0xb0000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		ram_console@44400000 {
+			reg = <0x0 0x44400000 0x0 0x10000>;
+			no-map;
+		};
+
+		ramoops@44410000 {
+			compatible = "ramoops";
+			reg = <0x0 0x44410000 0x0 0x70000>;
+			record-size = <0x1000>;
+			console-size = <0x40000>;
+			ftrace-size = <0x1000>;
+			pmsg-size = <0x10000>;
+		};
+
+		bringup-ramcon@44480000 {
+			reg = <0x0 0x44480000 0x0 0x20000>;
+			no-map;
+		};
+
+		minirdump@444f0000 {
+			reg = <0x0 0x444f0000 0x0 0x10000>;
+			no-map;
+		};
+
+		atf@44600000 {
+			reg = <0x0 0x44600000 0x0 0x40000>;
+			no-map;
+		};
+
+		preloader@44800000 {
+			reg = <0x0 0x44800000 0x0 0x100000>;
+			no-map;
+		};
+
+		lk@46000000 {
+			reg = <0x0 0x46000000 0x0 0x400000>;
+			no-map;
+		};
+
+		atf-log@7ff40000 {
+			reg = <0x0 0x7ff40000 0x0 0x40000>;
+			no-map;
+		};
+
+		log-store@7ff80000 {
+			reg = <0x0 0x7ff80000 0x0 0x80000>;
+			no-map;
+		};
+
+		ccci@8e000000 {
+			reg = <0x0 0x8e000000 0x0 0xa000000>;
+			no-map;
+		};
+
+		ccci-share@98000000 {
+			reg = <0x0 0x98000000 0x0 0x20000>;
+			no-map;
+		};
+
+		consys@9fe00000 {
+			reg = <0x0 0x9fe00000 0x0 0x100000>;
+			no-map;
+		};
+
+		spm@9ffe0000 {
+			reg = <0x0 0x9ffe0000 0x0 0x20000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * lk unconditionally applies the stock odmdtbo overlay and ASSERTs if a
+	 * target label is missing. Parking nodes (no compatible) keep lk happy.
+	 * Kept identical to k50v1's broad list to cover M5 Note's overlay.
+	 */
+	lk-overlay-sink {
+		lcm: lcm { status = "disabled"; };
+		pio: pio { status = "disabled"; };
+		odm: odm { status = "disabled"; };
+		accdet: accdet { status = "disabled"; };
+		touch: touch { status = "disabled"; };
+		kd_camera_hw1: kd-camera-hw1 { status = "disabled"; };
+		mtkfb: mtkfb { status = "disabled"; };
+		consys: consys { status = "disabled"; };
+		sleep: sleep { status = "disabled"; };
+		audgpio: audgpio { status = "disabled"; };
+		apuart0: apuart0 { status = "disabled"; };
+		irtx_pwm: irtx-pwm { status = "disabled"; };
+		speaker_gpio: speaker-gpio { status = "disabled"; };
+		nfc: nfc { status = "disabled"; };
+		usb0: usb0 { status = "disabled"; };
+		xhci0: xhci0 { status = "disabled"; };
+		i2c1: i2c1 { status = "disabled"; };
+		ext_buck_vmd1: ext-buck-vmd1 { status = "disabled"; };
+		hall: hall { status = "disabled"; };
+		i2c0: i2c0 { status = "disabled"; };
+		i2c2: i2c2 { status = "disabled"; };
+		i2c3: i2c3 { status = "disabled"; };
+		i2c4: i2c4 { status = "disabled"; };
+		eintc: eintc { status = "disabled"; };
+		msdc1_ins: msdc1-ins { status = "disabled"; };
+		otg_iddig_1: otg-iddig-1 { status = "disabled"; };
+		dsi_te: dsi-te { status = "disabled"; };
+		gpio_usage_mapping: gpio-usage-mapping { status = "disabled"; };
+		mt_pmic_vcama_ldo_reg: mt-pmic-vcama-ldo-reg { status = "disabled"; };
+		mt_pmic_vsim1_ldo_reg: mt-pmic-vsim1-ldo-reg { status = "disabled"; };
+		mt_pmic_vsim2_ldo_reg: mt-pmic-vsim2-ldo-reg { status = "disabled"; };
+		mt_pmic_vldo28_ldo_reg: mt-pmic-vldo28-ldo-reg { status = "disabled"; };
+		mt_pmic_vibr_ldo_reg: mt-pmic-vibr-ldo-reg { status = "disabled"; };
+		mt_pmic_vcamd_ldo_reg: mt-pmic-vcamd-ldo-reg { status = "disabled"; };
+		mt_pmic_vcamio_ldo_reg: mt-pmic-vcamio-ldo-reg { status = "disabled"; };
+		auxadc: auxadc { status = "disabled"; };
+		rf_clock_buffer_ctrl: rf-clock-buffer-ctrl { status = "disabled"; };
+		pmic_clock_buffer_ctrl: pmic-clock-buffer-ctrl { status = "disabled"; };
+		keypad: keypad { status = "disabled"; };
+	};
+
+	watchdog@10007000 {
+		compatible = "mediatek,mt6589-wdt";
+		mediatek,restart-bypass-pwrkey;
+		reg = <0 0x10007000 0 0x100>;
+	};
+};
+
+&{/timer} {
+	clock-frequency = <13000000>;
+};

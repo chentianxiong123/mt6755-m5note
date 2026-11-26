@@ -67,6 +67,14 @@ jobs:
         run: |
           cp mainline/7.3.1/build.sh .
           chmod +x build.sh
+          # 安装 M5 Note 板级 dts（不改 pminervini 原始 patch 链）
+          cp mainline/7.3.1/dts/mt6755-m5note.dts linux/arch/arm64/boot/dts/mediatek/
+          grep -q "mt6755-m5note.dtb" linux/arch/arm64/boot/dts/mediatek/Makefile || {
+            echo 'dtb-$(CONFIG_ARCH_MEDIATEK) += mt6755-m5note.dtb' >> linux/arch/arm64/boot/dts/mediatek/Makefile
+            echo 'DTC_FLAGS_mt6755-m5note := -@' >> linux/arch/arm64/boot/dts/mediatek/Makefile
+          }
+          # build.sh 用 m5note dtb 拼接
+          sed -i 's|mt6750-k50v1-tablet.dtb|mt6755-m5note.dtb|g' build.sh
 
       - name: Configure (pminervini fragments, only if missing)
         run: |
