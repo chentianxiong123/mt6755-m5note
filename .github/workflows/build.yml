@@ -34,9 +34,11 @@ jobs:
 
       - name: Apply 33 MT6755 patches
         run: |
+          git config --global user.email ci@local
+          git config --global user.name ci
           cd linux
           git init -q
-          git add -A && git -c user.email=ci@local -c user.name=ci commit -qm base
+          git add -A && git commit -qm base
           git am --whitespace=nowarn ../mainline/7.3.1/patches/linux/*.patch
           echo "=== patches applied: $(git log --oneline | wc -l) ==="
 
